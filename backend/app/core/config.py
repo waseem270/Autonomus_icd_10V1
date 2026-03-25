@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     GCP_LOCATION: str = "us-central1"
     GEMINI_MODEL: str = "gemini-3-flash-preview"
     GEMINI_MAX_TOKENS: int = 8000
-    GEMINI_TEMPERATURE: float = 0.5
+    GEMINI_TEMPERATURE: float = 0.75
     GEMINI_TOP_P: float = 0.0
     GEMINI_TIMEOUT: int = 60
     GEMINI_MAX_RETRIES: int = 3
