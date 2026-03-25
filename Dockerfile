@@ -36,7 +36,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=7860
 ENV TESSERACT_CMD=/usr/bin/tesseract
 
-# Command to run both services
-CMD python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 & \
+# Command to run both services (seed ICD data on first start)
+CMD python database/seeds/load_icd_data.py && \
+    python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 & \
     sleep 5 && \
     streamlit run frontend/app.py --server.port 7860 --server.address 0.0.0.0 --server.headless true
