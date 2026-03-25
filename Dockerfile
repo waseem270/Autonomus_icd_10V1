@@ -40,4 +40,10 @@ ENV TESSERACT_CMD=/usr/bin/tesseract
 CMD python database/seeds/load_icd_data.py && \
     python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 & \
     sleep 5 && \
-    streamlit run frontend/app.py --server.port 7860 --server.address 0.0.0.0 --server.headless true
+    streamlit run frontend/app.py \
+      --server.port 7860 \
+      --server.address 0.0.0.0 \
+      --server.headless true \
+      --server.enableXsrfProtection false \
+      --server.enableCORS false \
+      --server.maxUploadSize 25
