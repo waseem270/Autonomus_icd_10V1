@@ -1,4 +1,13 @@
-# Medical ICD Mapper
+---
+title: Autonomous ICD-10 Coding Tool
+emoji: 🏥
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+---
+
+# Autonomous ICD-10 Coding Tool
 
 A production-ready system for extracting clinical entities from medical prescriptions using NLP (scispaCy) and LLMs (Claude), mapping them to standardized ICD-10 codes.
 
