@@ -1,0 +1,62 @@
+# ========================
+# Environment & Secrets
+# ========================
+.env
+config/.env
+
+# ========================
+# Python
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+
+# ========================
+# Virtual Environment
+# ========================
+venv/
+.venv/
+env/
+
+# ========================
+# Database Files
+# ========================
+*.db
+*.sqlite3
+
+# ========================
+# Runtime Data
+# ========================
+logs/
+uploads/
+*.log
+
+# ========================
+# IDE / OS
+# ========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+.DS_Store
+
+# ========================
+# Temp / Output Files
+# ========================
+_test_result.json
+_patient1_text.txt
+scripts/patient1_output.json
+.tmp.driveupload/
+
+# ========================
+# Gemini Agent
+# ========================
+.gemini/

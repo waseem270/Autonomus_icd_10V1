@@ -1,0 +1,558 @@
+{
+  "system_prompt": "You are a senior clinical coding specialist. Extract ONLY diseases that are EXPLICITLY NAMED in the clinical document. Do NOT infer, assume, or fabricate any diagnosis. Every disease you output MUST have a verbatim quote from the document proving it exists. If you cannot point to an exact line where the disease is written, do NOT include it. Accuracy is more important than completeness — missing a real disease is better than adding a fake one.",
+  "user_prompt": {
+    "core_philosophy": "You are reading this document to find diseases that are EXPLICITLY WRITTEN in it. Extract ONLY conditions that are directly named, listed, or described as diagnoses in the text. Do NOT infer diseases from medications alone. Do NOT infer diseases from lab values alone. Do NOT add diseases based on clinical reasoning if the disease name does not appear in the document. For every disease you extract, you MUST be able to quote the exact sentence where it is named. If a condition is only implied but never stated, it does NOT belong in your output.",
+    "ANTI_HALLUCINATION_RULES": {
+      "CRITICAL_INSTRUCTION": "ZERO TOLERANCE FOR HALLUCINATION. Extract diagnoses ONLY if they are EXPLICITLY NAMED or LISTED in the document text. For EVERY diagnosis you extract, you MUST provide: (1) the exact disease name as written in the document, (2) the ICD-10 code, (3) MEAT evidence with VERBATIM quotes copied directly from the document, (4) the exact supporting sentence(s) copied from the document in context_snippets. If you cannot quote a sentence from the document that names this condition, DO NOT include it. It is BETTER to miss a real disease than to include a hallucinated one.",
+      "ABSOLUTE_PROHIBITIONS": [
+        "Do NOT infer or assume medical conditions that are not written in the document.",
+        "Do NOT add diseases based on demographic assumptions (age, gender, race).",
+        "Do NOT create diseases from medication names alone — a medication implies a condition ONLY if the condition is also named or described elsewhere in the document.",
+        "Do NOT extrapolate from lab values alone — an abnormal lab confirms a condition ONLY if that condition is also mentioned in Assessment, Problem List, or Plan.",
+        "Do NOT guess ICD-10 codes — if you are uncertain about the correct code, use the unspecified code for that category.",
+        "Do NOT fabricate evidence text — every M_monitor, E_evaluate, A_assess, and T_treat value MUST be a verbatim quote or direct paraphrase from the document. If no evidence exists, the field MUST be an empty string."
+      ],
+      "EVIDENCE_REQUIREMENT": "For each disease, the context_snippets array MUST contain at least one EXACT sentence or phrase copied verbatim from the document that proves this disease is mentioned. If you cannot find such a sentence, the disease is hallucinated and must NOT be included.",
+      "SECTION_RESTRICTION": {
+        "ALLOWED_PRIMARY_SECTIONS": [
+          "Assessment",
+          "Assessment and Plan",
+          "Plan",
+          "Problem List",
+          "Active Problems",
+          "Diagnosis",
+          "Impression"
+        ],
+        "ALLOWED_SUPPORTING_SECTIONS": [
+          "Medications",
+          "Current Medications",
+          "HPI",
+          "History of Present Illness",
+          "Chief Complaint",
+          "Lab Results",
+          "Imaging",
+          "Review of Systems",
+          "Vital Signs",
+          "Physical Exam"
+        ],
+        "RESTRICTED_SECTIONS": [
+          "Family History",
+          "Social History",
+          "Screening"
+        ],
+        "RULE": "A disease MUST appear in at least one ALLOWED_PRIMARY_SECTION (Assessment, Plan, Problem List, Active Problems, Diagnosis, Impression) to be classified as ACTIVE. Diseases in ALLOWED_SUPPORTING_SECTIONS (including Review of Systems, Vital Signs, Physical Exam, Medications, HPI, Lab Results, Imaging) provide cross-referencing MEAT evidence and can CONFIRM a disease that also appears in a primary section. When section headers are absent or the text is marked as General Clinical Narrative, do NOT exclude an explicitly named disease solely because the section is unlabeled. Only diseases appearing ONLY in RESTRICTED_SECTIONS (Family History, Social History, Screening) must be EXCLUDED. CRITICAL: For diseases listed in Problem List, actively scan ALL other sections (ROS, Medications, Vital Signs, Imaging) for supporting MEAT evidence. A Problem List disease with medication evidence = ACTIVE with Treatment. A Problem List disease mentioned in ROS = ACTIVE with monitoring/evaluation evidence from the ROS text."
+      },
+      "MEDICATION_INFERENCE_RULE": "STRICT RULE: A medication NEVER creates a disease on its own. A medication can only CONFIRM a disease that is ALREADY explicitly named in Assessment, Plan, Problem List, or PMH. If sertraline is on the medication list but 'depression' never appears in any section heading or text, do NOT extract depression. If metformin is listed but 'diabetes' is never named anywhere, do NOT extract diabetes. Medications are SUPPORTING evidence only — they are NOT a source of new diagnoses.",
+      "NER_CANDIDATE_HINT": "{{NER_CANDIDATES}}"
+    },
+    "clinical_document": "{{CLINICAL_NOTE}}",
+    "phase_1_section_mapping": {
+      "instruction": "Read the ENTIRE document from first word to last word before extracting anything. Identify every clinical section present. Sections may appear as labeled headers, bracketed labels, inline labels, or implicit by content even without a header.",
+      "section_weight_hierarchy": {
+        "highest_current_activity": [
+          "Assessment",
+          "Plan",
+          "Assessment and Plan",
+          "Impression",
+          "Clinical Decision",
+          "Diagnosis"
+        ],
+        "strong_active_management": [
+          "Medications",
+          "Current Medications",
+          "Active Medications",
+          "Prescription List"
+        ],
+        "moderate_ongoing_presence": [
+          "Problem List",
+          "Active Problem List",
+          "Active Problems",
+          "Chief Complaint",
+          "HPI"
+        ],
+        "supporting_cross_reference": [
+          "Review of Systems",
+          "ROS",
+          "Vital Signs",
+          "Physical Exam",
+          "Physical Examination"
+        ],
+        "historical_requires_crossref": [
+          "Past Medical History",
+          "PMH",
+          "Medical History",
+          "Surgical History"
+        ],
+        "restricted_no_diseases": [
+          "Family History",
+          "Social History"
+        ],
+        "diagnostic_imaging_sections": [
+          "Echocardiogram",
+          "Echo",
+          "Imaging",
+          "Radiology",
+          "Diagnostic Studies",
+          "Lab Results",
+          "Test Results"
+        ]
+      },
+      "crossref_elevation_rule": {
+        "instruction": "CRITICAL: For EVERY disease in Problem List or PMH, actively scan ALL other sections for MEAT evidence. A disease is ACTIVE if it appears in Problem List AND has ANY supporting evidence from: (1) Medications section — a medication that treats this condition = T_treat evidence, (2) Review of Systems — the condition is mentioned by name or its symptoms are discussed = M_monitor or E_evaluate evidence, (3) Vital Signs — a measurement relevant to this condition (e.g., BMI for obesity, BP for hypertension) = M_monitor evidence, (4) Imaging or Lab Results — a test result relevant to this condition = E_evaluate evidence, (5) Assessment or Plan — the condition is discussed = A_assess evidence. Track ALL sections where each disease is mentioned in the all_sections_mentioned field.",
+        "section_identity_rule": "CRITICAL: Problem List and Past Medical History are DIFFERENT sections. When a disease comes from the 'Problem List' section, use source_section='problem_list' — do NOT use 'past_medical_history'. 'Past Medical History' (PMH) refers to historical conditions not necessarily active. 'Problem List' lists current active conditions. If the document has a section titled 'Problem List' or 'Active Problem List', diseases extracted from it MUST use source_section='problem_list', NOT 'past_medical_history'.",
+        "examples": [
+          "Essential Hypertension in Problem List + 'hypertension' mentioned in ROS Cardiovascular + losartan in Medications = ACTIVE with M_monitor from ROS, T_treat from Medications",
+          "Obesity in Problem List + BMI 36.6 in Vital Signs = ACTIVE with M_monitor from Vital Signs",
+          "Type 2 Diabetes in Problem List + 'diabetes mellitus type 2' in ROS Endocrine + metformin in Medications = ACTIVE with cross-section evidence",
+          "Glaucoma in Problem List + 'history of glaucoma' in ROS Eyes + Lumigan in Medications = ACTIVE with cross-section evidence"
+        ]
+      },
+      "z_code_detection": {
+        "instruction": "Z-codes represent important billable statuses that are frequently missed. Scan the ENTIRE document for these triggers and code them as ACTIVE diseases.",
+        "status_post_device": {
+          "triggers": [
+            "s/p pacemaker",
+            "s/p PPM",
+            "pacemaker placement",
+            "s/p ICD",
+            "s/p defibrillator",
+            "s/p stent",
+            "device clinic",
+            "remote transmission",
+            "pacemaker check"
+          ],
+          "codes": "Z95.0 (pacemaker), Z95.810 (ICD/defibrillator), Z95.5 (coronary stent)",
+          "rule": "If a device is mentioned AND there is evidence of ongoing management (device clinic, remote monitoring, battery check), code the Z-code as ACTIVE with MEAT evidence."
+        },
+        "long_term_medication": {
+          "triggers": [
+            "on anticoagulation",
+            "on warfarin",
+            "on Eliquis",
+            "on Xarelto",
+            "on insulin",
+            "on immunosuppression",
+            "long-term",
+            "chronic medication"
+          ],
+          "codes": "Z79.01 (long-term anticoagulant), Z79.02 (long-term antithrombotic), Z79.4 (long-term insulin), Z79.899 (other long-term medication)",
+          "rule": "If a patient is on a chronic medication that has a Z79.x code, this MUST be extracted as a separate codeable condition."
+        },
+        "surgical_status": {
+          "triggers": [
+            "s/p CABG",
+            "s/p valve replacement",
+            "s/p hip replacement",
+            "s/p transplant",
+            "history of surgery",
+            "postoperative care",
+            "post-operative care",
+            "postop care",
+            "post surgical",
+            "surgical aftercare"
+          ],
+          "codes": "Z95.1 (CABG), Z95.2 (prosthetic heart valve), Z96.x (other implants), Z98.x (other post-surgical states), Z48.89 (encounter for other specified surgical aftercare)",
+          "rule": "Surgical history with ongoing clinical relevance (follow-up, device still in place, affecting treatment decisions) should be coded. CRITICAL: 'Postoperative care' or 'Postoperative care following surgery' in Assessment IS a billable Z-code condition (Z48.89). It is NOT a workflow phrase — it is a codeable encounter reason. Always extract it as a disease with ICD code Z48.89."
+        }
+      }
+    },
+    "phase_2_disease_detection": {
+      "instruction": "Go through the document section by section. For each section reason through its content clinically using all five questions below.",
+      "reasoning_questions": {
+        "Q1_explicit_diagnosis": "Is there a named medical condition, disease, disorder, or diagnosis in this text? Look for condition names, diagnostic labels, clinical syndromes, pathological states in any format — abbreviated, full name, or described clinically. Expand all abbreviations to full clinical terms before proceeding.",
+        "Q2_medication_reasoning": "Is there a medication listed? A medication ONLY confirms a disease that is ALREADY NAMED elsewhere in the document (Assessment, Plan, Problem List, or PMH). A medication alone does NOT prove a disease exists. If sertraline is on the medication list but depression is never named in any section, do NOT extract depression. Only use medications to CONFIRM diseases that are explicitly documented.",
+        "Q3_lab_imaging_reasoning": "Are there laboratory values or imaging results? An abnormal lab value ONLY supports a disease that is ALREADY NAMED in the Assessment, Plan, Problem List, or PMH. An abnormal lab value MUST NOT be used to infer or invent a disease that is not explicitly named in the document. If HbA1c is elevated but diabetes is never mentioned in any section, do NOT extract diabetes. Labs CONFIRM documented diseases — they do NOT create new diagnoses.",
+        "Q3a_echo_and_imaging_diagnosis_extraction": "CRITICAL: Echocardiogram, imaging, and diagnostic study findings are ACTIVE diagnoses when they appear in BOTH an imaging report AND in Assessment, PMH, or Problem List. Examples: Echo showing 'moderate tricuspid regurgitation' + Medical History listing 'tricuspid regurgitation' = ACTIVE diagnosis (code I07.1). Echo showing 'moderate mitral regurgitation' + Assessment discussing valve disease = ACTIVE diagnosis. CT showing 'pulmonary nodule' + Plan ordering follow-up CT = ACTIVE condition requiring monitoring. Every structural finding on Echo or imaging that correlates with a documented condition MUST be extracted as its own disease with appropriate ICD-10 code.",
+        "Q4_narrative_reasoning": "Does the clinical narrative describe a pathological state even without explicitly naming it? Look for descriptions of symptoms, exam findings, or functional status that clinically imply a diagnosis, clinician descriptions of disease behavior such as worsening, stable, exacerbating, in remission, or patient complaints the clinician is attributing to an underlying condition.",
+        "Q5_cross_section_confirmation": "Does this condition appear in more than one section? A condition in PMH that also has a medication = actively treated = ACTIVE. A condition in PMH that also appears in Assessment = currently assessed = ACTIVE. A condition mentioned in HPI being worked up in Plan = ACTIVE. Track where each condition appears across all sections — this determines MEAT evidence in Phase 3."
+      },
+      "NOT_A_DISEASE": {
+        "instruction": "The following are NOT diseases and must NEVER appear in the diseases output array. They are clinical workflow phrases, not diagnoses.",
+        "excluded_phrase_patterns": [
+          "chronic disease management",
+          "disease management",
+          "medication management",
+          "care coordination",
+          "health maintenance",
+          "preventive care",
+          "wellness visit",
+          "follow-up visit",
+          "medication reconciliation",
+          "care plan",
+          "patient education",
+          "counseling",
+          "screening",
+          "routine exam",
+          "annual physical"
+        ],
+        "rule": "If what you extracted describes a clinical ACTIVITY, WORKFLOW, or MANAGEMENT PROCESS rather than a pathological condition with an ICD-10 code, it is NOT a disease. Only extract actual medical diagnoses, disorders, conditions, and pathological states. EXCEPTION: 'Postoperative care' and 'Surgical aftercare' ARE billable Z-code conditions (Z48.x) and MUST be extracted when they appear in Assessment. They are encounter reasons, not workflow phrases."
+      },
+      "assessment_section_mandatory": {
+        "instruction": "The Assessment and Plan section is the MOST IMPORTANT section in any clinical note. Every numbered item, bulleted item, or labeled condition in Assessment MUST be extracted as a disease. Do NOT skip any Assessment item. If a condition appears in Assessment, it is ACTIVE by definition.",
+        "rule": "After completing disease detection, COUNT the number of items in the Assessment section. Then COUNT the number of diseases you extracted from Assessment. These numbers MUST match. If they do not match, you have missed diseases — go back and extract them.",
+        "strict_enforcement": {
+          "step_1": "STOP. List every numbered item, bulleted item, or labeled condition in Assessment. Write each one out explicitly with its number or label.",
+          "step_2": "For EACH Assessment item, confirm you have a corresponding disease in your output. Map Assessment item number → disease name.",
+          "step_3": "If any Assessment item has no matching disease in your output, you have FAILED. Go back and extract the missing condition immediately.",
+          "step_4": "Abbreviated conditions in Assessment (e.g., MR, HTN, CKD, AF, TR) MUST be expanded and extracted. MR = Mitral Regurgitation, TR = Tricuspid Regurgitation, AF/AFib = Atrial Fibrillation, SND = Sinus Node Dysfunction.",
+          "critical_rule": "Assessment items that discuss a condition implicitly (e.g., an Assessment item about valve disease that mentions mitral or tricuspid regurgitation) count as separate extractable diseases for EACH valve condition mentioned."
+        },
+        "assessment_expansion_rule": {
+          "instruction": "When an Assessment item uses a CATEGORY term (e.g., 'Valve disease', 'Metabolic conditions', 'Cardiac issues') that mentions or implies specific named conditions, extract EACH specific condition as a SEPARATE disease.",
+          "rule": "Do NOT extract the category label itself. Extract only the specific, codeable conditions mentioned within or implied by that category item.",
+          "examples": [
+            "'Assessment #3: Valve disease - moderate MR and TR, stable' → Extract: (1) Mitral Regurgitation, (2) Tricuspid Regurgitation. Do NOT extract 'Valve disease'.",
+            "'Assessment #5: Diabetes with complications' → Extract: (1) Type 2 Diabetes Mellitus, and any named complications (e.g., Diabetic Retinopathy). Do NOT extract 'Diabetes with complications' as a single entry.",
+            "'Assessment #2: HTN, well-controlled' → Extract: Essential Hypertension. Expand the abbreviation."
+          ]
+        }
+      },
+      "completeness_check": "After scanning all sections ask: Have I extracted EVERY SINGLE numbered or bulleted item from the Assessment and Plan section that names a medical condition? Have I captured every condition the clinician listed as an active problem? Do NOT add diseases just to reach a certain count. Only extract diseases that are EXPLICITLY NAMED in the document.",
+      "HALLUCINATION_FINAL_CHECK": "MANDATORY BEFORE OUTPUT: For EACH disease in your list, answer these questions: (1) Can I quote the EXACT LINE from the document where this disease is explicitly named? If I cannot quote a specific line → REMOVE THIS DISEASE IMMEDIATELY. (2) Is EVERY piece of MEAT evidence a VERBATIM quote that I can locate in the document? If I generated or paraphrased any evidence → REPLACE with actual verbatim quote or set to empty string. (3) Did I add this disease ONLY because of a medication or ONLY because of a lab value, without the disease being explicitly named in Assessment, Plan, Problem List, or PMH? If YES → REMOVE from diseases and MOVE to excluded_conditions. (4) Did I INFER this disease from clinical reasoning without it being explicitly written? If YES → REMOVE IT. Only diseases with explicit textual proof survive this check."
+    },
+    "phase_3_meat_validation": {
+      "instruction": "For EVERY disease collected in Phase 2, apply MEAT validation through clinical reasoning. Do not assume MEAT evidence — find it explicitly in the document text and quote verbatim.",
+      "meat_components": {
+        "M_monitor": {
+          "clinical_meaning": "The clinician is actively observing THIS SPECIFIC condition over time.",
+          "evidence_signals": [
+            "Laboratory values being reviewed or ordered to track THIS SPECIFIC condition — not general vitals",
+            "Vital signs documented and linked specifically to THIS condition's management",
+            "Symptom tracking or disease trend documentation for THIS condition",
+            "Scheduled follow-up specifically for THIS condition",
+            "Any quantitative measurement being used to gauge THIS specific disease's progress"
+          ],
+          "CRITICAL_RULE": "The evidence MUST be clinically related to THIS disease. An ECG monitors cardiac conditions ONLY — it does NOT monitor diabetes, obesity, hypothyroidism, neuropathy, or bladder conditions. Height/Weight/BMI monitors obesity or nutrition — it does NOT monitor cardiac arrhythmias, neuropathy, or hypertension. If no disease-specific monitoring exists for this condition, M_monitor MUST be empty string."
+        },
+        "E_evaluate": {
+          "clinical_meaning": "The clinician is actively investigating THIS SPECIFIC condition through diagnostics.",
+          "evidence_signals": [
+            "Imaging studies ordered or reviewed for THIS SPECIFIC condition",
+            "Laboratory panels ordered to characterize THIS condition specifically",
+            "Specialist referrals placed for THIS condition",
+            "Functional or physiological testing for THIS condition",
+            "Procedural evaluation such as biopsy, endoscopy, cardiac catheterization for THIS condition"
+          ],
+          "CRITICAL_RULE": "The evaluation evidence MUST be diagnostically relevant to THIS disease. A lipid panel evaluates hyperlipidemia — NOT hypertension or diabetes. An HbA1c evaluates diabetes — NOT obesity or neuropathy. Height/Weight/BMI evaluates nutritional status or obesity — NOT cardiac conditions. If no disease-specific evaluation exists, E_evaluate MUST be empty string."
+        },
+        "A_assess": {
+          "clinical_meaning": "The clinician has rendered active clinical judgment about THIS SPECIFIC condition.",
+          "evidence_signals": [
+            "Condition listed as numbered or labeled item in Assessment or Plan",
+            "Clinician commented on status: controlled, uncontrolled, stable, worsening, improved, decompensated, exacerbating, in remission, poorly controlled",
+            "Condition named in differential or clinical impression",
+            "Clinician making management decision based on this condition"
+          ],
+          "automatic_rule": "Any condition explicitly named in Assessment or Plan = A is automatically satisfied",
+          "CRITICAL_RULE": "The A_assess evidence MUST quote the specific Assessment item or clinical judgment about THIS disease. Do NOT use a generic description. Quote the actual text from the Assessment section that names or describes this condition."
+        },
+        "T_treat": {
+          "clinical_meaning": "A therapeutic intervention is actively being applied for THIS SPECIFIC condition.",
+          "evidence_signals": [
+            "Medication on active medication list that treats THIS SPECIFIC condition",
+            "New prescription or dose adjustment made at this encounter for THIS condition",
+            "Procedure, surgery, or therapeutic intervention performed for THIS condition",
+            "Device being managed for THIS condition: CPAP, insulin pump, pacemaker, wound VAC",
+            "Therapy referral for THIS condition: physical therapy, occupational therapy, behavioral health, cardiac rehab",
+            "Wound care, infusion therapy, or injection therapy for THIS condition"
+          ],
+          "automatic_rule": "Any active medication treating this condition = T is automatically satisfied",
+          "CRITICAL_RULE": "The treatment MUST be pharmacologically or therapeutically linked to THIS disease. Lisinopril treats hypertension — NOT diabetes. Metformin treats diabetes — NOT hypertension. Gabapentin treats neuropathic pain — NOT obesity. Name the SPECIFIC medication and dose, not just 'Medications' or 'Procedures'."
+        }
+      },
+      "EVIDENCE_UNIQUENESS_RULE": {
+        "instruction": "CRITICAL: MEAT evidence MUST be disease-specific and MUST NOT be reused across diseases.",
+        "rules": [
+          "Each M_monitor value must reference a monitoring activity clinically relevant to THAT specific disease only.",
+          "Each E_evaluate value must reference a diagnostic test clinically relevant to THAT specific disease only.",
+          "Each A_assess value must quote the specific assessment text about THAT specific disease.",
+          "Each T_treat value must name the specific medication, procedure, or therapy for THAT specific disease.",
+          "NEVER assign the same evidence string to multiple diseases. If ECG is relevant to coronary artery disease, it cannot also be the M_monitor for obesity or hypothyroidism.",
+          "NEVER use generic labels like 'Medications', 'Procedures', 'Problem List' as evidence. Always quote specific text.",
+          "If a disease has no specific evidence for a MEAT component, the field MUST be an empty string — do NOT fill it with unrelated evidence from another disease."
+        ],
+        "anti_pattern_examples": [
+          "WRONG: M_monitor = 'Height Weight BMI' for coronary artery disease (BMI monitors obesity, not CAD)",
+          "WRONG: M_monitor = 'Electrocardiogram' for obesity (ECG monitors cardiac rhythm, not weight)",
+          "WRONG: T_treat = 'Medications' for any disease (must name the SPECIFIC medication)",
+          "WRONG: T_treat = 'Procedures' for any disease (must name the SPECIFIC procedure)",
+          "WRONG: E_evaluate = 'Height Weight BMI' for neuropathy (BMI does not evaluate nerve function)",
+          "CORRECT: M_monitor = 'HbA1c 7.2% reviewed' for diabetes",
+          "CORRECT: M_monitor = 'ECG showing normal sinus rhythm' for atrial fibrillation",
+          "CORRECT: T_treat = 'Lisinopril 10mg daily' for hypertension",
+          "CORRECT: T_treat = 'Metformin 1000mg BID' for type 2 diabetes",
+          "CORRECT: E_evaluate = 'Lipid panel ordered' for hyperlipidemia",
+          "CORRECT: A_assess = 'Assessment #3: Essential Hypertension - stable' for hypertension"
+        ]
+      },
+      "meat_grading": {
+        "Full MEAT": {
+          "score": "4/4",
+          "meaning": "All four components have explicit documented evidence. Comprehensively managed. Maximum coding confidence."
+        },
+        "Medium MEAT": {
+          "score": "3/4",
+          "meaning": "Three components have explicit documented evidence. Actively and substantially managed."
+        },
+        "Half MEAT": {
+          "score": "2/4",
+          "meaning": "Two components have explicit documented evidence. Meaningful clinical activity but not fully documented."
+        },
+        "Partial MEAT": {
+          "score": "1/4",
+          "meaning": "Only one component has explicit documented evidence. Minimum threshold. Active but documentation is lean."
+        },
+        "No MEAT": {
+          "score": "0/4",
+          "meaning": "No component has explicit documented evidence. Cannot confirm active status. Classify as HISTORICAL."
+        }
+      },
+      "meat_threshold_rule": {
+        "instruction": "CRITICAL FILTER: Only diseases with meat_score >= 1 may appear in the final 'diseases' array as ACTIVE. Any disease with meat_score = 0 (No MEAT) MUST be moved to 'excluded_conditions' with reason 'NO_MEAT_EVIDENCE'. This applies REGARDLESS of the section the disease was found in."
+      },
+      "active_status_rules": {
+        "active_threshold": "MEAT grade LOW_MEAT or above — score >= 1",
+        "historical_threshold": "MEAT grade NO_MEAT — score = 0",
+        "fast_track_rules": [
+          "Rule 1: Condition explicitly listed in Assessment or Plan → ACTIVE (A confirmed)",
+          "Rule 2: Active medication exists for this condition → ACTIVE (T confirmed)",
+          "Rule 3: Condition on Problem List without resolved or inactive notation → ACTIVE",
+          "Rule 4: Condition in PMH + active medication for it → ACTIVE (T confirmed)",
+          "Rule 5: Condition in PMH with NO supporting evidence anywhere else → HISTORICAL",
+          "Rule 6: MEAT score = 0 after validation → move to excluded_conditions, NOT active output"
+        ],
+        "primary_activation_basis_format": "[LETTER]: [verbatim evidence from document] — example: TREAT: Metformin 1000mg BID on active medication list"
+      }
+    },
+    "phase_4_icd10_coding": {
+      "instruction": "Assign the most specific ICD-10-CM code the documentation supports. Use clinical reasoning — do not default to unspecified codes when documentation provides sufficient detail.",
+      "specificity_checklist": [
+        "Has the type been specified? (Type 1 vs Type 2, primary vs secondary)",
+        "Has laterality been documented? (right, left, bilateral)",
+        "Has chronicity been documented? (acute, chronic, acute-on-chronic)",
+        "Has severity been documented? (mild, moderate, severe, critical)",
+        "Has a complication or manifestation been documented? (e.g., diabetes WITH neuropathy, WITH nephropathy, WITH retinopathy)",
+        "Has the status been documented? (controlled, uncontrolled, with exacerbation, in remission)"
+      ],
+      "clinical_context_rule": {
+        "instruction": "CRITICAL: When assigning ICD codes, you MUST consider the patient's FULL clinical context — especially comorbidities. A condition that is a known complication or manifestation of another documented condition MUST use the combination or etiology-specific code.",
+        "examples": [
+          "Patient has Type 2 Diabetes + retinopathy → code as Diabetic Retinopathy (E11.319) NOT generic Retinopathy (H35.9)",
+          "Patient has Type 2 Diabetes + neuropathy → code as Diabetic Polyneuropathy (E11.42) NOT generic Polyneuropathy (G62.9)",
+          "Patient has Type 2 Diabetes + nephropathy → code as Diabetic Nephropathy (E11.21) NOT generic CKD",
+          "Patient has Hypertension + CKD → code as Hypertensive Chronic Kidney Disease (I12.9) NOT separate codes",
+          "Patient has Hypertension + Heart Disease → code as Hypertensive Heart Disease (I11.9) NOT separate codes",
+          "Patient has Obesity + Type 2 Diabetes → include both E66.01 and E11.xx with appropriate specificity"
+        ],
+        "rule": "Always ask: Does this condition have a CAUSAL or COMPLICATION relationship with another condition in this patient? If yes, use the combination or etiology-specific ICD code. Never code a diabetic complication as a standalone generic condition."
+      },
+      "rule": "Apply highest specificity code fully supported by documentation. If qualifier is not documented do not assume it — use appropriate unspecified code. Note in icd10_selection_reasoning why this code was chosen over alternatives."
+    },
+    "phase_5_exclusion_logging": {
+      "instruction": "Every condition evaluated but not classified as ACTIVE must be logged with the exact term, section it appeared in, and specific clinical reason for exclusion.",
+      "exclusion_categories": {
+        "HISTORICAL": "Appeared only in PMH or past history with no current MEAT evidence",
+        "FAMILY_HISTORY": "Condition belongs to a family member not the patient",
+        "NEGATED": "Explicitly denied, ruled out, or absent — denies, no history of, r/o, negative for",
+        "SYMPTOM_ONLY": "A symptom without an associated confirmed diagnosis",
+        "RESOLVED": "Explicitly documented as resolved, healed, cured, or no longer active",
+        "NO_MEAT_EVIDENCE": "Condition is mentioned but no Monitor, Evaluate, Assess, or Treat evidence exists in this document"
+      },
+      "negation_vs_resolution_rules": {
+        "instruction": "CRITICAL: Distinguish between these three negation types. They are NOT the same.",
+        "never_had": {
+          "triggers": [
+            "no history of",
+            "denies",
+            "negative for",
+            "r/o",
+            "ruled out",
+            "no evidence of"
+          ],
+          "action": "EXCLUDE — patient never had this condition.",
+          "exclusion_reason": "NEGATED"
+        },
+        "previously_had_now_resolved": {
+          "triggers": [
+            "no recurrence",
+            "resolved",
+            "healed",
+            "no longer",
+            "remission",
+            "cured",
+            "no further episodes",
+            "doing excellent",
+            "doing well",
+            "doing fine",
+            "completely healed"
+          ],
+          "action": "EXCLUDE as RESOLVED — patient previously had this condition but it is no longer active. IMPORTANT: When a post-surgical condition is described as 'doing excellent' or 'doing well' with no new findings, no treatment changes, and no monitoring orders, it is RESOLVED. Do NOT extract it as a separate active disease. Example: 'status post left carpal tunnel release, doing excellent' means the LEFT carpal tunnel is resolved and should NOT be coded as an active disease.",
+          "exclusion_reason": "RESOLVED",
+          "example": "'No recurrence of epistaxis' means epistaxis was previously active but is now resolved. Do NOT code R04.0 as ACTIVE."
+        },
+        "absent_but_monitored": {
+          "triggers": [
+            "no signs of bleeding on",
+            "no complications from",
+            "tolerating well",
+            "no side effects"
+          ],
+          "action": "The ABSENCE of a complication does NOT negate the underlying condition being monitored. 'No signs of bleeding on Eliquis' means anticoagulation is being monitored (the underlying AFib is ACTIVE), but epistaxis is RESOLVED.",
+          "example": "'No signs of bleeding on the Eliquis' → AFib = ACTIVE (being treated with Eliquis), Epistaxis = RESOLVED (no recurrence)"
+        }
+      }
+    },
+    "phase_6_self_verification": {
+      "instruction": "Before writing JSON output verify every item below. If any check fails return to the document and correct before outputting.",
+      "checklist": [
+        "Have I extracted every item explicitly listed in the Assessment and Plan section that names a medical condition?",
+        "STOP: Count Assessment items vs extracted Assessment diseases. Do they match? If not, FIX NOW.",
+        "Have I applied the Assessment Expansion Rule — extracting each specific condition from category items (e.g., 'Valve disease' → separate MR and TR entries)?",
+        "HALLUCINATION CHECK: For EACH disease in my list, can I quote the EXACT LINE from the document where this disease is explicitly named? If not, REMOVE IT NOW.",
+        "MEDICATION CHECK: Did I add any disease ONLY because of a medication, without the disease being named in Assessment/Plan/Problem List/PMH? If yes, REMOVE IT.",
+        "LAB CHECK: Did I add any disease ONLY because of a lab value, without the disease being named in Assessment/Plan/Problem List/PMH? If yes, REMOVE IT.",
+        "Does every ACTIVE disease have ALL 4 MEAT components explicitly set — even as empty string if not found?",
+        "Does every ACTIVE disease have meat_score >= 1? Any disease with meat_score = 0 MUST be in excluded_conditions, not in diseases array.",
+        "Does every ACTIVE disease have primary_activation_basis populated?",
+        "Is the MEAT Level terminology correct? Must be exactly: 'Full MEAT', 'Medium MEAT', 'Half MEAT', or 'Partial MEAT'. Never use FULL_MEAT, HIGH_MEAT, PARTIAL_MEAT, or LOW_MEAT.",
+        "Have I expanded all abbreviations to full clinical terms (MR, TR, HTN, AF, SND, CKD, etc.)?",
+        "Have I applied maximum ICD-10 specificity based on what is documented?",
+        "Is EVERY piece of MEAT evidence a VERBATIM QUOTE from the document? If I generated or paraphrased any evidence, replace with actual quote or set to empty string.",
+        "EVIDENCE UNIQUENESS CHECK: For each MEAT component (M/E/A/T), is the evidence clinically specific to THAT disease? ECG evidence must only appear for cardiac conditions. Height/Weight/BMI must only appear for obesity/nutrition.",
+        "GENERIC EVIDENCE CHECK: Have I used 'Medications', 'Procedures', 'Problem List', or 'Height Weight BMI' as evidence for diseases where it is not clinically relevant? If yes, set to empty string.",
+        "DUPLICATE EVIDENCE CHECK: Is any evidence string repeated identically across multiple diseases? If yes, keep it only for the most relevant disease. Set other copies to empty string."
+      ]
+    },
+    "phase_7_output_format": {
+      "instruction": "Return ONLY raw valid JSON. No markdown. No backticks. No explanatory text before or after. Begin response with opening brace. End with closing brace.",
+      "csv_transform_rules": {
+        "instruction": "After building the diseases array, populate csv_ready_output. For EVERY entry in diseases, create one corresponding entry in csv_ready_output using these extraction rules.",
+        "segment_selection": "If disease source_section is 'assessment' or 'assessment_and_plan' → Segment = 'Assessment'. Else if 'problem_list' → Segment = 'Problem List'. Else if 'medications' or priority_level contains 'Medication' → Segment = 'Medications'. Else use source_section as-is.",
+        "meat_component_extraction": {
+          "Monitor": "Use meat_validation.M_monitor — first sentence only. MUST be specific to this disease. If null or not disease-specific → empty string.",
+          "Evaluate": "Use meat_validation.E_evaluate — first sentence only. MUST be specific to this disease. If null or not disease-specific → empty string.",
+          "Assess": "Use meat_validation.A_assess — first sentence only. Must quote actual assessment text about this disease. If null → empty string.",
+          "Treatment": "Use meat_validation.T_treat — SPECIFIC medication name + dose, or SPECIFIC procedure name. NEVER use generic 'Medications' or 'Procedures'. If null → empty string."
+        },
+        "meat_level_mapping": "Use exact string from meat_grade field: 'Full MEAT', 'Medium MEAT', 'Half MEAT', or 'Partial MEAT'."
+      },
+      "schema": {
+        "sections_found": [
+          "List every section header identified in the document in document order"
+        ],
+        "summary": {
+          "total_diseases_considered": 0,
+          "total_active_diseases": 0,
+          "total_historical": 0,
+          "total_icd10_assigned": 0,
+          "full_meat_count": 0,
+          "high_meat_count": 0,
+          "partial_meat_count": 0,
+          "low_meat_count": 0,
+          "assessment_sourced": 0,
+          "pmh_sourced": 0,
+          "medication_inferred": 0,
+          "lab_implied": 0,
+          "total_excluded": 0
+        },
+        "diseases": [
+          {
+            "index": 1,
+            "disease_name": "Full normalized clinical term with all documented qualifiers",
+            "active_status": "ACTIVE",
+            "meat_grade": "Full MEAT | Medium MEAT | Half MEAT | Partial MEAT",
+            "meat_score": 3,
+            "priority_level": "1-Assessment | 2-ProblemList | 3-Medication-Inferred | 4-Lab-Implied | 5-HPI | 6-ChiefComplaint",
+            "source_section": "Primary section where this disease was identified",
+            "all_sections_mentioned": [
+              "Every section in the document where this disease or its evidence appears"
+            ],
+            "context_snippets": [
+              "Exact verbatim quote from Assessment or Plan if present",
+              "Exact verbatim quote from PMH or Problem List if present",
+              "Exact medication name and dose if present",
+              "Exact lab value or imaging finding if present"
+            ],
+            "meat_validation": {
+              "M_monitor": "Exact verbatim quote from document showing monitoring evidence or null",
+              "E_evaluate": "Exact verbatim quote from document showing evaluation evidence or null",
+              "A_assess": "Exact verbatim quote from Assessment or Plan section or null",
+              "T_treat": "Exact medication name and dose or procedure name from document or null",
+              "meat_score": 3,
+              "meat_grade": "HIGH_MEAT",
+              "meat_grade_reasoning": "One sentence explaining why this grade was assigned based on which components are satisfied and which are absent",
+              "primary_activation_basis": "ASSESS: Listed in Assessment and Plan as #2 — Type 2 Diabetes Mellitus, poorly controlled, HbA1c 8.9%"
+            },
+            "icd10_code": "E11.65",
+            "icd10_description": "Type 2 diabetes mellitus with hyperglycemia",
+            "icd10_selection_reasoning": "E11.65 chosen over E11.9 because HbA1c 8.9% with documented poor control confirms hyperglycemia",
+            "hcc_status": "YES"
+          }
+        ],
+        "csv_ready_output": [
+          {
+            "Disease": "Full normalized clinical term",
+            "ICD_10_Code": "E11.65",
+            "Segment": "Assessment | Problem List | Medications | HPI | PMH",
+            "Monitor": "Verbatim monitoring evidence or 'Not documented'",
+            "Evaluate": "Verbatim evaluation evidence or 'Not documented'",
+            "Assess": "Verbatim assessment evidence or 'Not documented'",
+            "Treatment": "Medication name + dose or procedure name or 'Not documented'",
+            "MEAT_Level": "Full MEAT | Medium MEAT | Half MEAT | Partial MEAT"
+          }
+        ],
+        "excluded_conditions": [
+          {
+            "term": "Exact condition text as it appears in document",
+            "reason_excluded": "HISTORICAL | FAMILY_HISTORY | NEGATED | SYMPTOM_ONLY | RESOLVED | NO_MEAT_EVIDENCE",
+            "source_section": "Section where it appeared",
+            "exclusion_reasoning": "One sentence clinical explanation of why this was excluded"
+          }
+        ]
+      }
+    },
+    "phase_8_dietary_and_meat_based_analysis": {
+      "instruction": "This phase is OPTIONAL and runs ONLY when explicitly requested by the user (include_dietary_analysis = true). When NOT requested, skip this phase entirely — do not add dietary_classification or meat_restriction_rationale fields to any disease entry, and include ALL active diseases regardless of dietary relationship.",
+      "default_behavior": "By default (include_dietary_analysis = false), output ALL diseases with meat_score >= 1 in the diseases array. Do NOT filter by dietary category. Do NOT annotate with meat-based classification unless requested.",
+      "when_enabled_behavior": "When include_dietary_analysis = true, ADD dietary_classification and dietary_evidence and meat_restriction_rationale fields to each disease entry as annotations. Do NOT remove any disease from the diseases array based on dietary classification — only annotate.",
+      "completely_active_definition": {
+        "rule": "A disease is 'COMPLETELY ACTIVE' if it has a TREAT component (active medication OR active intervention) AND at least 2 other MEAT components (Monitor, Evaluate, or Assess).",
+        "rationale": "Ensures the disease is not just documented but actively managed with therapeutic intervention and ongoing clinical oversight."
+      },
+      "meat_based_classification": {
+        "definition": "Diseases where red meat, processed meat, or animal product consumption is a PRIMARY or MAJOR modifiable risk factor documented in clinical guidelines.",
+        "major_meat_related_categories": [
+          "Cardiovascular diseases (hyperlipidemia, hypertension, CAD, stroke, CHF)",
+          "Metabolic diseases (Type 2 diabetes, obesity, metabolic syndrome)",
+          "Renal diseases (CKD, nephrotic syndrome)",
+          "Gastrointestinal diseases (GERD, diverticulitis, colorectal conditions)",
+          "Inflammatory conditions (gout, certain arthritis types)"
+        ],
+        "automatic_NOT_meat_based": [
+          "Allergic rhinitis/environmental allergies",
+          "Depression/anxiety/mental health",
+          "Infectious diseases",
+          "Skin conditions (unless clearly metabolic)",
+          "Hearing loss",
+          "Mechanical/structural conditions"
+        ]
+      },
+      "dietary_recommendations_linking": {
+        "instruction": "Extract ALL dietary recommendations from the Assessment/Plan section. For each recommendation, identify which disease(s) it targets. Look for keywords like: red meat, processed meat, animal products, protein sources, saturated fat, cholesterol-rich foods."
+      },
+      "final_output_logic": {
+        "instruction": "Your final 'diseases' array MUST include 'dietary_classification' and 'meat_restriction_rationale' for every entry. If the user's focus is on meat-based diseases, ensure these are prioritized.",
+        "diabetes_coding_rule": {
+          "critical": "Type 2 Diabetes is ALWAYS E11.xx. Type 1 is E10.xx. E08.xx is secondary diabetes. Document must explicitly state 'due to' another condition to use E08. Do not use E08 for standard Type 2 Diabetes."
+        }
+      },
+      "updated_disease_schema_additions": {
+        "dietary_classification": "MEAT_BASED | NOT_MEAT_BASED",
+        "dietary_evidence": "Verbatim quote from document linking this disease to meat/dietary advice, or clinical guideline reference",
+        "meat_restriction_rationale": "One sentence clinical explanation of WHY limiting meat helps this specific disease (e.g., reduces saturated fat -> lowers LDL, or reduces nitrogenous waste in CKD)",
+        "is_completely_active": "true | false (based on the definition in Phase 8)"
+      }
+    },
+    "final_instruction": "BEGIN EXTRACTION NOW."
+  }
+}

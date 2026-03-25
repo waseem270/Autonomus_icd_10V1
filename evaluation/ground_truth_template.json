@@ -1,0 +1,36 @@
+{
+  "_instructions": "Fill in this template for each test document. This is used by evaluate.py to measure pipeline accuracy.",
+  "_fields": {
+    "document_id": "Unique identifier matching the uploaded filename",
+    "diseases": "Array of expected disease entities",
+    "diseases[].name": "Canonical disease name as it appears in the note",
+    "diseases[].icd_code": "Expected ICD-10-CM code (e.g. E11.9)",
+    "diseases[].meat_valid": "true if Assessment + at least one of M/E/T is documented",
+    "diseases[].negated": "true if the condition is denied/absent/ruled out",
+    "diseases[].section": "Which section the disease primarily appears in (e.g. assessment_and_plan)"
+  },
+  "documents": [
+    {
+      "document_id": "Patient 1.pdf",
+      "annotator": "YOUR_NAME",
+      "annotation_date": "2025-01-01",
+      "diseases": [
+        {
+          "name": "Type 2 Diabetes Mellitus",
+          "icd_code": "E11.9",
+          "meat_valid": true,
+          "negated": false,
+          "section": "assessment_and_plan"
+        },
+        {
+          "name": "Essential Hypertension",
+          "icd_code": "I10",
+          "meat_valid": true,
+          "negated": false,
+          "section": "assessment_and_plan"
+        }
+      ],
+      "notes": "Add or remove diseases as needed. Only include conditions that a human coder would code."
+    }
+  ]
+}
