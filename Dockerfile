@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR $HOME/app
 
+# Create required folders as root, then chown to user
+RUN mkdir -p uploads logs database && chown -R user:user $HOME/app
+
 # Copy requirements and install as user
 COPY --chown=user requirements.txt .
 USER user
@@ -24,9 +27,6 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Copy the rest of the application
 COPY --chown=user . .
-
-# Create required folders
-RUN mkdir -p uploads logs database
 
 # Expose port (HF Spaces expects 7860)
 EXPOSE 7860
