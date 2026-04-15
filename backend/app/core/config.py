@@ -22,7 +22,9 @@ class Settings(BaseSettings):
     API_PREFIX: str = "/api/v1"
     DEBUG: bool = True
     
-    # Database - Absolute path
+    # Database — supports both SQLite (dev) and PostgreSQL (production)
+    # Override via DATABASE_URL env var for PostgreSQL:
+    #   DATABASE_URL=postgresql+psycopg2://user:pass@host:5432/dbname
     DATABASE_URL: str = f"sqlite:///{DATABASE_DIR}/medical_icd.db"
     
     # CORS
@@ -38,12 +40,25 @@ class Settings(BaseSettings):
     GCP_PROJECT: str = "gen-lang-client-0574304931"
     GCP_LOCATION: str = "us-central1"
     GEMINI_MODEL: str = "gemini-3-flash-preview"
-    GEMINI_MAX_TOKENS: int = 8000
-    GEMINI_TEMPERATURE: float = 0.75
-    GEMINI_TOP_P: float = 0.0
+    GEMINI_MAX_TOKENS: int = 16384
+    GEMINI_TEMPERATURE: float = 0.5
+    GEMINI_TOP_P: float = 0.95
     GEMINI_TIMEOUT: int = 60
     GEMINI_MAX_RETRIES: int = 3
     GEMINI_RETRY_DELAY: int = 2
+    
+    # OpenAI
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_MODEL: str = "gpt-5.4"
+    
+    # LLM Provider: "openai", "gemini", or empty (auto-detect)
+    LLM_PROVIDER: str = ""
+    
+    # Cost & Token Control limits
+    # Halts pipeline extraction if the cumulative session exceeds these
+    # Set to 0 or 0.0 to essentially disable limits.
+    MAX_SESSION_COST_USD: float = 5.00
+    MAX_SESSION_TOKENS: int = 2_000_000
     
     # OCR Configuration
     TESSERACT_CMD: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -70,9 +85,15 @@ class Settings(BaseSettings):
     # Logging - Absolute path
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = str(LOGS_DIR / "app.log")
+    LOG_FORMAT_JSON: bool = True  # Structured JSON logs; set False for plain-text dev output
     
-    # Security
+    # Security — MUST be overridden via SECRET_KEY env var in production
     SECRET_KEY: str = "your-secret-key-change-in-production"
+    
+    # Confidence scoring weights
+    CONFIDENCE_WEIGHT_MEAT: float = 0.4
+    CONFIDENCE_WEIGHT_ICD: float = 0.3
+    CONFIDENCE_WEIGHT_DISEASE: float = 0.3
     
     # Determine .env path: prefer root .env, fall back to config/.env
     _root_env = os.path.join(BASE_DIR, ".env")
@@ -88,9 +109,60 @@ class Settings(BaseSettings):
 # Create global settings instance
 settings = Settings()
 
+
+def get_llm_provider() -> str:
+    """Determine which LLM provider to use: 'openai' or 'gemini'."""
+    if settings.LLM_PROVIDER:
+        return settings.LLM_PROVIDER.lower()
+    # Auto-detect: prefer OpenAI if key is set, else fall back to Gemini
+    if settings.OPENAI_API_KEY:
+        return "openai"
+    if settings.GEMINI_API_KEY:
+        return "gemini"
+    return "gemini"
+
+
+def get_active_model() -> str:
+    """Return the model name for the active LLM provider."""
+    provider = get_llm_provider()
+    if provider == "openai":
+        return settings.OPENAI_MODEL
+    return settings.GEMINI_MODEL
+
+
 # Cached Gemini client — created lazily on first use
 _genai_client = None
 _genai_client_initialized = False
+
+# Cached OpenAI client
+_openai_client = None
+_openai_client_initialized = False
+
+
+def create_openai_client():
+    """Create or return the cached OpenAI client."""
+    global _openai_client, _openai_client_initialized
+    
+    if _openai_client_initialized:
+        return _openai_client
+    
+    import logging
+    _logger = logging.getLogger(__name__)
+    
+    if settings.OPENAI_API_KEY:
+        try:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            _logger.info("OpenAI client initialised via API key.")
+            _openai_client = client
+            _openai_client_initialized = True
+            return client
+        except Exception as e:
+            _logger.error(f"OpenAI API key init failed: {e}")
+    
+    _logger.error("No OPENAI_API_KEY configured.")
+    _openai_client_initialized = True
+    return None
 
 
 def create_genai_client():

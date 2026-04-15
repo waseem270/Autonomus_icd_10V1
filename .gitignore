@@ -38,6 +38,20 @@ uploads/
 *.log
 
 # ========================
+# Test/Debug Files
+# ========================
+test_*.py
+*_result*.json
+*_output*.txt
+debug_*.py
+check_report.py
+extract_texts.py
+extracted_texts*.txt
+token_breakdown_*.json
+7750233_full_text.txt
+__check.bin
+
+# ========================
 # IDE / OS
 # ========================
 .vscode/
