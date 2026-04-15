@@ -22,6 +22,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
 
 DB_PATH = os.path.join(PROJECT_ROOT, "database", "medical_icd.db")
 DATA_PATH = os.path.join(PROJECT_ROOT, "database", "Final_ICD_10_CM.xlsx")
+TXT_DATA_PATH = os.path.join(SCRIPT_DIR, "data", "icd10cm-codes-April-2025.txt")
 LOG_DIR = os.path.join(PROJECT_ROOT, "database", "seeds")
 ERROR_LOG = os.path.join(LOG_DIR, "icd_load_errors.log")
 
@@ -80,6 +81,34 @@ class ICD10Loader:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_description ON icd10_codes(description)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hcc_status ON icd10_codes(hcc_status)")
 
+    def parse_txt(self):
+        """Read ICD-10 records from the plain-text fallback file.
+        
+        Format: each line is <CODE><whitespace><Description>
+        e.g.: A000    Cholera due to Vibrio cholerae 01, biovar cholerae
+        """
+        print(f"Opening txt fallback: {TXT_DATA_PATH}...")
+        records = []
+        errors = 0
+        with open(TXT_DATA_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                # Split on first whitespace sequence: CODE + rest = description
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    errors += 1
+                    continue
+                code = parts[0].strip()
+                description = parts[1].strip()
+                if not code or not description:
+                    errors += 1
+                    continue
+                records.append((code, description, "Non-HCC"))
+        print(f"Parsed {len(records)} valid records from txt, {errors} skipped.")
+        return records
+
     def parse_excel(self):
         """Read ICD-10 records from the Excel file."""
         print(f"Opening {self.data_path}...")
@@ -130,11 +159,22 @@ class ICD10Loader:
             logging.error(f"Batch insert error: {e}")
 
     def load(self, reset=False, limit=None):
-        """Process Excel file and load into SQLite."""
-        if not os.path.exists(self.data_path):
-            print(f"Error: Data file not found at {self.data_path}")
-            print("Please ensure Final_ICD_10_CM.xlsx exists in the database folder.")
-            return
+        """Process ICD data file and load into SQLite.
+        
+        Uses Final_ICD_10_CM.xlsx if available, otherwise falls back to
+        the plain-text file (database/seeds/data/icd10cm-codes-April-2025.txt).
+        """
+        xlsx_available = os.path.exists(self.data_path)
+        txt_available = os.path.exists(TXT_DATA_PATH)
+
+        if not xlsx_available and not txt_available:
+            print(f"Error: No ICD data file found.")
+            print(f"  Tried xlsx: {self.data_path}")
+            print(f"  Tried txt:  {TXT_DATA_PATH}")
+            sys.exit(1)
+
+        if not xlsx_available:
+            print(f"xlsx not found — using txt fallback: {TXT_DATA_PATH}")
 
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -142,7 +182,7 @@ class ICD10Loader:
         self.setup_database(cursor, reset)
         conn.commit()
 
-        all_records = self.parse_excel()
+        all_records = self.parse_excel() if xlsx_available else self.parse_txt()
         if limit:
             all_records = all_records[:limit]
 
