@@ -8,9 +8,9 @@ from datetime import datetime
 
 try:
     import openpyxl
+    _OPENPYXL_AVAILABLE = True
 except ImportError:
-    print("openpyxl is required. Install it with: pip install openpyxl")
-    sys.exit(1)
+    _OPENPYXL_AVAILABLE = False
 
 # Set working directory to project root if script is run from seeds folder
 if os.path.basename(os.getcwd()) == 'seeds':
@@ -111,6 +111,9 @@ class ICD10Loader:
 
     def parse_excel(self):
         """Read ICD-10 records from the Excel file."""
+        if not _OPENPYXL_AVAILABLE:
+            print("openpyxl not installed — cannot parse xlsx. Using txt fallback.")
+            return self.parse_txt()
         print(f"Opening {self.data_path}...")
         wb = openpyxl.load_workbook(self.data_path, read_only=True)
         ws = wb.active
@@ -164,7 +167,7 @@ class ICD10Loader:
         Uses Final_ICD_10_CM.xlsx if available, otherwise falls back to
         the plain-text file (database/seeds/data/icd10cm-codes-April-2025.txt).
         """
-        xlsx_available = os.path.exists(self.data_path)
+        xlsx_available = os.path.exists(self.data_path) and _OPENPYXL_AVAILABLE
         txt_available = os.path.exists(TXT_DATA_PATH)
 
         if not xlsx_available and not txt_available:
