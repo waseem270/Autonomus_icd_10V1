@@ -11,7 +11,7 @@ sleep 3
 exec streamlit run frontend/app.py \
     --server.port 7860 \
     --server.address 0.0.0.0 \
-    --server.headless true \
+    --server.headless false \
     --server.enableXsrfProtection false \
     --server.enableCORS false \
     --server.maxUploadSize 25 \

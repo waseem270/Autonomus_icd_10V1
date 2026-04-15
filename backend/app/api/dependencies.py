@@ -1,42 +1,9 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from typing import Generator
+"""
+API dependencies — re-exports the canonical DB session from core.database.
 
-from ..core.config import settings
-from ..utils.pdf_detector import detect_pdf_type
+All routes should use ``get_db`` from this module (or directly from
+``backend.app.core.database``).  There is intentionally only ONE engine
+and ONE SessionLocal for the entire application.
+"""
 
-# Create SQLite engine
-# Note: connect_args={"check_same_thread": False} is required for SQLite
-engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    echo=settings.DEBUG
-)
-
-# Session factory
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
-
-def create_tables():
-    """Create all database tables."""
-    Base.metadata.create_all(bind=engine)
-
-def get_db() -> Generator[Session, None, None]:
-    """
-    Database session dependency for FastAPI.
-    
-    Usage:
-        @router.get("/endpoint")
-        def my_endpoint(db: Session = Depends(get_db)):
-            ...
-    
-    Yields session and automatically closes it after request.
-    """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+from ..core.database import get_db, create_tables  # noqa: F401

@@ -167,7 +167,9 @@ class MEATDiseaseResult(BaseModel):
     meat_data: MEATValidationData
     validation: MEATValidationResult
     final_status: str  # "valid", "invalid", "review", "history_only"
-    meat_tier: Optional[str] = None  # "full_meat", "medium_meat", "half_meat", "history_only", "invalid"
+    meat_tier: Optional[str] = None  # "strong_evidence", "moderate_evidence", "weak_evidence", "no_meat"
+    meat_status: Optional[str] = None  # Human-readable status message
+    evidence_based: Optional[bool] = None  # True if all MEAT components backed by document evidence
     disease_status: Optional[str] = None  # "Active Chronic", "Active Acute", "Chronic", "History Only"
     meat_criteria_count: Optional[int] = None
     segment_source: Optional[List[str]] = None

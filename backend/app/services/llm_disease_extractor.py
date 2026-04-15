@@ -76,7 +76,8 @@ class LLMDiseaseExtractor:
 
         try:
             self._client = None
-            self.model_name = settings.GEMINI_MODEL
+            from ..core.config import get_active_model
+            self.model_name = get_active_model()
 
             self.config = types.GenerateContentConfig(
                 temperature=0.0,
@@ -105,15 +106,20 @@ class LLMDiseaseExtractor:
             )
         except Exception as e:
             self.logger.error(
-                f"Failed to initialize Gemini for disease extraction: {e}"
+                f"Failed to initialize LLM for disease extraction: {e}"
             )
             self._client = None
 
     @property
     def client(self):
         if self._client is None:
-            from ..core.config import create_genai_client
-            self._client = create_genai_client()
+            from ..core.config import get_llm_provider, create_genai_client, create_openai_client
+            provider = get_llm_provider()
+            if provider == "openai":
+                oai = create_openai_client()
+                self._client = oai if oai else "__openai_sentinel__"
+            else:
+                self._client = create_genai_client()
         return self._client
 
     def _is_rate_limited(self, error: Exception) -> bool:
@@ -159,18 +165,24 @@ class LLMDiseaseExtractor:
             return []
 
         # ── Collect text from ALL primary sections (ordered: assessment first) ──
+        def _get_sec_text(sec: Any) -> str:
+            """Safely extract text from a section value (dict or str)."""
+            if isinstance(sec, dict):
+                return sec.get("text", "") or ""
+            return str(sec) if sec else ""
+
         primary_texts: Dict[str, str] = {}
         for key in _PRIMARY_SECTIONS:          # _PRIMARY_SECTIONS is a list, order preserved
             sec = sections.get(key)
-            if sec and sec.get("text", "").strip():
-                primary_texts[key] = sec["text"].strip()
+            if sec and _get_sec_text(sec).strip():
+                primary_texts[key] = _get_sec_text(sec).strip()
 
         if not primary_texts:
             self.logger.info("No primary section text found — trying secondary sections.")
             for key in _SECONDARY_SECTIONS:
                 sec = sections.get(key)
-                if sec and sec.get("text", "").strip():
-                    primary_texts[key] = sec["text"].strip()
+                if sec and _get_sec_text(sec).strip():
+                    primary_texts[key] = _get_sec_text(sec).strip()
             if not primary_texts:
                 self.logger.info("No suitable section text found — nothing to extract.")
                 return []
@@ -197,8 +209,8 @@ class LLMDiseaseExtractor:
             if key in primary_texts:
                 continue
             sec = sections.get(key)
-            if sec and sec.get("text", "").strip():
-                all_other_texts[key] = sec["text"].strip()
+            if sec and _get_sec_text(sec).strip():
+                all_other_texts[key] = _get_sec_text(sec).strip()
 
         prompt = self._build_prompt(primary_text, primary_section_key, all_other_texts)
 
@@ -225,7 +237,35 @@ class LLMDiseaseExtractor:
             elif response_text.startswith("```"):
                 response_text = response_text.replace("```", "").strip()
 
-            raw_diseases: List[Dict] = json.loads(response_text)
+            parsed = json.loads(response_text)
+
+            # OpenAI json_object mode wraps arrays in an object — unwrap
+            if isinstance(parsed, dict):
+                # Find the list value (could be "diseases", "results", etc.)
+                raw_diseases = []
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        raw_diseases = v
+                        break
+                if not raw_diseases:
+                    self.logger.warning(
+                        f"LLM returned dict with no list values: {list(parsed.keys())}"
+                    )
+                    raw_diseases = []
+            elif isinstance(parsed, list):
+                raw_diseases = parsed
+            else:
+                self.logger.warning(f"Unexpected JSON type from LLM: {type(parsed)}")
+                raw_diseases = []
+
+            # Normalise: if LLM returned a list of strings instead of dicts,
+            # wrap each string into the expected dict format.
+            if raw_diseases and isinstance(raw_diseases[0], str):
+                raw_diseases = [
+                    {"disease_name": name, "section_sources": [primary_section_key],
+                     "confidence": 0.90, "status": "active"}
+                    for name in raw_diseases if name.strip()
+                ]
 
             # ── Post-process: patch section sources using Assessment text ────
             # This deterministically ensures diseases in Assessment numbered
@@ -364,9 +404,10 @@ Return ONLY the JSON array.
         assessment_raw_text = ""
         for key in _ASSESSMENT_KEYS:
             sec = sections.get(key)
-            if sec and sec.get("text", "").strip():
-                assessment_text_lower += " " + sec["text"].lower()
-                assessment_raw_text += " " + sec["text"]
+            _st = (sec.get("text", "") if isinstance(sec, dict) else str(sec or ""))
+            if sec and _st.strip():
+                assessment_text_lower += " " + _st.lower()
+                assessment_raw_text += " " + _st
 
         # Pattern to find numbered Assessment items and their comma-separated diseases
         # e.g. "1.Essential hypertension: ..." or "3.Major depression/moderate/recurrent, anxiety, insomnia:"
@@ -383,8 +424,9 @@ Return ONLY the JSON array.
 
         for key in _ASSESSMENT_KEYS:
             sec = sections.get(key)
-            if sec and sec.get("text", "").strip():
-                for m in numbered_item_pattern.finditer(sec["text"]):
+            _st = (sec.get("text", "") if isinstance(sec, dict) else str(sec or ""))
+            if sec and _st.strip():
+                for m in numbered_item_pattern.finditer(_st):
                     raw_item = m.group(1).strip()  # e.g. "Major depression/moderate/recurrent, anxiety, insomnia"
                     fragment = raw_item.lower()
                     # Split on ", " to catch comma-separated lists

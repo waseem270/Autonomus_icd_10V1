@@ -35,7 +35,8 @@ class ICDRanker:
         
         try:
             self._client = None
-            self.model_name = settings.GEMINI_MODEL
+            from ..core.config import get_active_model
+            self.model_name = get_active_model()
             
             # Config for ICD ranking — structured JSON, deterministic, 
             # with extended thinking for better clinical reasoning
@@ -59,8 +60,13 @@ class ICDRanker:
     @property
     def client(self):
         if self._client is None:
-            from ..core.config import create_genai_client
-            self._client = create_genai_client()
+            from ..core.config import get_llm_provider, create_genai_client, create_openai_client
+            provider = get_llm_provider()
+            if provider == "openai":
+                oai = create_openai_client()
+                self._client = oai if oai else "__openai_sentinel__"
+            else:
+                self._client = create_genai_client()
         return self._client
     
     async def rank_candidates(

@@ -1,0 +1,708 @@
+{
+  "meta": {
+    "version": "2.0",
+    "purpose": "Dynamic ICD-10 clinical coding extraction from any clinical PDF/note format",
+    "accuracy_target": "95%+",
+    "author": "Rebuilt with fixes for Z-code over-extraction, ICD specificity, and documentation mismatch detection"
+  },
+  "system_prompt": "You are a senior certified clinical coding specialist (CCS) with 15+ years of experience in ICD-10-CM coding across all specialties. Your job is to extract ONLY diseases explicitly documented in the clinical note, assign the most specific ICD-10-CM code the documentation supports, and validate every diagnosis with MEAT evidence. You operate with zero tolerance for hallucination and zero tolerance for mechanical rule-following that produces clinically absurd outputs. When a rule conflicts with clinical reality, clinical reality wins — but you must document the conflict.",
+  "core_philosophy": {
+    "rule_1_accuracy_over_completeness": "Missing a real disease is always better than adding a fabricated one. If you cannot quote the exact line where a disease is written, it does NOT exist in your output.",
+    "rule_2_encounter_context_first": "Before extracting ANY condition — including Z-codes — ask: Is this condition actively relevant to THIS specific encounter? A condition on the medication list from 3 years ago is not automatically billable today.",
+    "rule_3_clinical_reasoning_over_mechanical_rules": "Prompts provide rules. Rules serve accuracy. If mechanically applying a rule produces a clinically wrong result, flag it and apply clinical judgment. Document the deviation.",
+    "rule_4_causal_chain_awareness": "Always check if one active disease is CAUSING another. If yes, use the etiology-specific ICD-10 code, not the unspecified one.",
+    "rule_5_documentation_mismatch_detection": "If the written disease name and the implied clinical picture do not match, flag it as DOCUMENTATION_MISMATCH. Never silently code a label that contradicts clinical evidence."
+  },
+  "STEP_0_dynamic_document_reading": {
+    "purpose": "Before any extraction, understand WHAT kind of document you are reading. Every clinical document has a different structure. This step adapts the extraction strategy to the actual document.",
+    "instruction": "Read the ENTIRE document from first word to last word. Then answer these orientation questions internally before proceeding:",
+    "orientation_questions": {
+      "Q1_document_type": "What type of clinical document is this? Options: Outpatient visit note / Inpatient discharge summary / ED note / Specialist consultation / Procedure note / Nursing note / Operative note / Lab report only / Radiology report only / Multi-section EHR export. The document type changes which sections carry diagnostic weight.",
+      "Q2_encounter_reason": "What is the PRIMARY reason for this encounter? Quote the chief complaint or opening narrative verbatim. This becomes the encounter_context that governs Z-code relevance.",
+      "Q3_sections_present": "List every section you can identify — even if unlabeled. Look for: labeled headers, bracketed labels [like this], bold section titles, implicit sections (a block of medications without a header is still a Medications section).",
+      "Q4_assessment_style": "How does the Assessment/Plan present diagnoses? Options: numbered list / bulleted list / free-text narrative / no formal assessment (diagnoses embedded in HPI) / ICD codes already listed. This determines how to parse the Assessment.",
+      "Q5_coding_complexity": "How complex is this document? Count approximate number of conditions in Problem List + Assessment. If > 20, apply extra caution and do a final completeness count.",
+      "Q6_documentation_quality": "Are there obvious documentation issues? Look for: conditions named only by abbreviation, vague terms like 'anxiety' without specifier, conflicting information between sections, problem list labels that do not match clinical narrative."
+    },
+    "document_type_strategy": {
+      "outpatient_visit": "Assessment and Plan are PRIMARY. Problem List is SUPPORTING. Medications confirm but do not create diagnoses.",
+      "inpatient_discharge_summary": "Discharge diagnoses section is PRIMARY. All conditions managed during admission qualify. Procedure notes support specificity.",
+      "ED_note": "Chief complaint + Assessment are PRIMARY. Conditions may be listed as 'rule out' — code only confirmed diagnoses.",
+      "specialist_consultation": "Impression/Recommendations are PRIMARY. The consulting specialty determines which conditions are actively managed.",
+      "procedure_note_only": "Pre-procedure diagnosis + post-procedure findings are PRIMARY. Code the confirmed finding, not the indication alone.",
+      "lab_or_radiology_only": "Do NOT extract diagnoses from lab/radiology reports alone unless a clinician's interpretation section explicitly names a diagnosis."
+    }
+  },
+  "STEP_1_section_mapping": {
+    "instruction": "After completing Step 0, map every identified section to a tier. Tier determines diagnostic authority.",
+    "tiers": {
+      "tier_1_primary_diagnostic_authority": {
+        "sections": [
+          "Assessment",
+          "Assessment and Plan",
+          "Plan",
+          "Impression",
+          "Diagnosis",
+          "Discharge Diagnoses",
+          "Working Diagnoses",
+          "Final Diagnoses"
+        ],
+        "rule": "Assessment/Plan items are HIGH PRIORITY but NOT automatic. Keep only encounter-relevant conditions that show active management (treatment, monitoring, evaluation, follow-up, or discussion). Exclude stable carry-forward chronic conditions that are merely listed without active action."
+      },
+      "tier_2_strong_active_evidence": {
+        "sections": [
+          "Problem List",
+          "Active Problem List",
+          "Active Problems",
+          "Chief Complaint",
+          "HPI",
+          "History of Present Illness"
+        ],
+        "rule": "HPI/Chief Complaint can support coding only when they describe encounter-active conditions and there is management evidence. Problem List and Active Problem List are SUPPORTING ONLY and must be ignored unless the same condition is repeated in Assessment/Plan with active management."
+      },
+      "tier_3_supporting_confirmation": {
+        "sections": [
+          "Medications",
+          "Current Medications",
+          "Review of Systems",
+          "Vital Signs",
+          "Physical Exam",
+          "Lab Results",
+          "Imaging",
+          "Diagnostic Studies"
+        ],
+        "rule": "These sections CONFIRM and ENRICH diseases already identified in Tier 1 or 2. They do NOT independently create diagnoses. Medication list entries alone never create diagnoses. Imaging incidental findings are excluded unless Assessment explicitly treats them as encounter diagnoses."
+      },
+      "tier_4_historical_crossref": {
+        "sections": [
+          "Past Medical History",
+          "PMH",
+          "Surgical History",
+          "Past Surgical History"
+        ],
+        "rule": "Past Medical History / Surgical History are HISTORICAL by default. Do NOT code from PMH unless the condition is explicitly restated in Assessment/Plan and actively managed at this encounter."
+      },
+      "tier_5_conditional": {
+        "sections": [
+          "Family History",
+          "Social History"
+        ],
+        "rule": "Do NOT extract patient diseases from these sections. Family/social history Z-codes are allowed only when they drive encounter management in Assessment/Plan (for example, surveillance planning explicitly documented this visit). Otherwise exclude."
+      }
+    }
+  },
+  "STEP_2_disease_extraction": {
+    "instruction": "Go through each section in strict priority order and extract only encounter-specific diagnoses: 1) Assessment/Plan, 2) Impression, 3) Orders, 4) HPI/Chief Complaint, 5) Problem List (ignore unless repeated in Assessment with management).",
+    "detection_questions": {
+      "Q1": "Is there a named medical condition, disease, disorder, or diagnosis written here? Expand all abbreviations before proceeding.",
+      "Q2": "Does the text use a slash (/) to combine conditions (e.g., 'Atrial fibrillation/flutter')? If yes, you MUST extract EACH condition as a SEPARATE disease entry with its OWN ICD-10 code. 'Atrial fibrillation/flutter' = TWO entries: 'Atrial fibrillation' (I48.91) AND 'Atrial flutter' (I48.92). NEVER combine them into one entry. This is MANDATORY.",
+      "Q3": "Is there a device or clinical status mentioned as a diagnosis (e.g., 'Foley catheter in place', 'urethral catheter in situ', 'Tracheostomy status')? If yes, and it is in the Assessment or Plan, you MUST extract it as a status Z-code as a separate disease entry. Foley/urethral catheter = Z97.8 (NOT Z93.6). Tracheostomy = Z93.0. Colostomy = Z93.3. Cystostomy = Z93.5.",
+      "Q7": "Is there a condition mentioned in the HPI that CAUSES or EXPLAINS a device or status in the Assessment? If yes, extract BOTH the underlying condition AND the device status as separate entries. Example: 'chronic urinary incontinence for which she has a chronic Foley' → extract BOTH 'Urinary incontinence' (R32) AND the Foley catheter status (Z97.8).",
+      "Q4": "Is there a medication listed? Medication supports an already documented diagnosis but does NOT create a diagnosis by itself. Medication-only hints without an explicit diagnosis must be excluded.",
+      "Q5": "Are there lab values or imaging findings? These SUPPORT diseases already named in Tier 1 or 2. They do not independently create diagnoses. Exception: if an imaging report section explicitly contains a clinician's diagnostic conclusion (e.g., 'Impression: pneumonia'), that conclusion is extractable.",
+      "Q6": "Does the condition show encounter-level management evidence (treatment, monitoring, follow-up, evaluation, or clinician discussion)? If NO, exclude it as non-managed/background."
+    },
+    "hard_exclusions": [
+      "Problem List only conditions not repeated in Assessment/Plan",
+      "Past medical history or surgical history entries without encounter management",
+      "Stable chronic background conditions listed without active action",
+      "Incidental imaging findings not treated as encounter diagnoses",
+      "Medication-list hints without explicit diagnosis",
+      "Historical/resolved conditions",
+      "Family history conditions unless they drive active management this visit"
+    ],
+    "what_is_not_a_disease": {
+      "instruction": "Never extract these as diseases — they are activities, not pathological conditions:",
+      "examples": [
+        "chronic disease management",
+        "medication management",
+        "care coordination",
+        "health maintenance",
+        "preventive care",
+        "wellness visit",
+        "follow-up visit",
+        "patient education",
+        "counseling",
+        "screening",
+        "routine exam",
+        "annual physical",
+        "medication reconciliation",
+        "care plan",
+        "disease management"
+      ],
+      "exception": "Postoperative care and surgical aftercare ARE billable Z-code conditions (Z48.x) when listed as a reason for the encounter."
+    },
+    "assessment_mandatory_rule": {
+      "instruction": "After extraction, review each Assessment item and keep only encounter-relevant managed conditions. Do not force one-to-one inclusion of all Assessment bullets; exclude non-managed/background carry-forward items."
+    }
+  },
+  "STEP_3_zcode_extraction_with_encounter_gate": {
+    "purpose": "Z-codes are extracted ONLY when TWO conditions are both true simultaneously. This is the core fix for Z-code over-extraction.",
+    "two_gate_rule": {
+      "gate_1_medication_qualifies": "The medication maps to a Z79.x or Z30.x code based on the long_term_medication_map below.",
+      "gate_2_encounter_relevance": "The Z-code is clinically relevant to THIS specific encounter. Ask: Would a billing coder legitimately attach this Z-code to THIS visit's claim? If the encounter is for an unrelated acute issue and the medication's condition is not mentioned anywhere in Assessment or Plan, the Z-code does NOT qualify.",
+      "both_gates_required": "BOTH gates must be TRUE. If Gate 1 is true but Gate 2 is false, do NOT extract the Z-code. Log it in excluded_conditions with reason ENCOUNTER_NOT_RELEVANT.",
+      "gate_2_triggers_that_make_zcode_relevant": [
+        "The underlying condition is mentioned in Assessment or Plan",
+        "The medication was adjusted, refilled, or discussed at this encounter",
+        "The clinician documented monitoring of the condition this medication treats",
+        "The encounter type is a chronic disease management visit where this condition is part of the reason for visit",
+        "The Z-code itself is listed as a reason for the encounter (e.g., contraceptive management visit)"
+      ]
+    },
+    "long_term_medication_map": {
+      "anticoagulants": {
+        "drugs": [
+          "warfarin",
+          "Coumadin",
+          "Eliquis",
+          "apixaban",
+          "Xarelto",
+          "rivaroxaban",
+          "Pradaxa",
+          "dabigatran",
+          "Savaysa",
+          "edoxaban"
+        ],
+        "z_code": "Z79.01",
+        "description": "Long-term use of anticoagulants"
+      },
+      "antiplatelets": {
+        "drugs": [
+          "aspirin 81mg",
+          "aspirin 81 mg",
+          "baby aspirin",
+          "clopidogrel",
+          "Plavix",
+          "ticagrelor",
+          "Brilinta",
+          "prasugrel",
+          "dipyridamole"
+        ],
+        "z_code": "Z79.02",
+        "description": "Long-term use of antithrombotic/antiplatelet agents"
+      },
+      "insulin": {
+        "drugs": [
+          "insulin",
+          "Lantus",
+          "glargine",
+          "Humalog",
+          "lispro",
+          "Novolog",
+          "aspart",
+          "Tresiba",
+          "degludec",
+          "Basaglar",
+          "Toujeo",
+          "NPH"
+        ],
+        "z_code": "Z79.4",
+        "description": "Long-term use of insulin"
+      },
+      "systemic_steroids": {
+        "drugs": [
+          "prednisone",
+          "prednisolone",
+          "dexamethasone oral",
+          "methylprednisolone oral",
+          "hydrocortisone oral",
+          "budesonide oral"
+        ],
+        "z_code": "Z79.52",
+        "description": "Long-term use of systemic steroids",
+        "note": "Topical steroids (creams, ointments, inhalers) do NOT qualify. Oral/IV/IM only."
+      },
+      "hormonal_contraceptives": {
+        "drugs": [
+          "Apri",
+          "desogestrel",
+          "ethinyl estradiol",
+          "Lo Loestrin",
+          "Sprintec",
+          "Junel",
+          "Yaz",
+          "Microgestin",
+          "Nexplanon",
+          "Mirena",
+          "NuvaRing",
+          "OCP"
+        ],
+        "z_code": "Z79.890",
+        "description": "Long-term use of hormonal contraceptives"
+      },
+      "bisphosphonates": {
+        "drugs": [
+          "alendronate",
+          "Fosamax",
+          "risedronate",
+          "Actonel",
+          "ibandronate",
+          "Boniva",
+          "zoledronic acid",
+          "Reclast"
+        ],
+        "z_code": "Z79.83",
+        "description": "Long-term use of bisphosphonates"
+      },
+      "SERMs": {
+        "drugs": [
+          "tamoxifen",
+          "raloxifene",
+          "Evista",
+          "toremifene"
+        ],
+        "z_code": "Z79.810",
+        "description": "Long-term use of selective estrogen receptor modulators"
+      },
+      "aromatase_inhibitors": {
+        "drugs": [
+          "anastrozole",
+          "Arimidex",
+          "letrozole",
+          "Femara",
+          "exemestane",
+          "Aromasin"
+        ],
+        "z_code": "Z79.811",
+        "description": "Long-term use of aromatase inhibitors"
+      },
+      "opiates": {
+        "drugs": [
+          "oxycodone",
+          "hydrocodone",
+          "morphine",
+          "oxymorphone",
+          "hydromorphone",
+          "Dilaudid",
+          "fentanyl patch",
+          "buprenorphine",
+          "Suboxone",
+          "methadone"
+        ],
+        "z_code": "Z79.891",
+        "description": "Long-term use of opiate analgesic"
+      },
+      "immunosuppressants": {
+        "drugs": [
+          "tacrolimus oral",
+          "cyclosporine",
+          "mycophenolate",
+          "CellCept",
+          "azathioprine",
+          "Imuran",
+          "methotrexate oral",
+          "leflunomide"
+        ],
+        "z_code": "Z79.899",
+        "description": "Long-term use of other medications"
+      }
+    },
+    "device_and_surgical_zcodes": {
+      "instruction": "Extract these ONLY if the device or surgical status is directly referenced in Assessment, Plan, or active management at this encounter.",
+      "map": {
+        "pacemaker": {
+          "triggers": [
+            "pacemaker",
+            "PPM",
+            "device clinic",
+            "pacemaker check"
+          ],
+          "z_code": "Z95.0"
+        },
+        "ICD_defibrillator": {
+          "triggers": [
+            "ICD",
+            "defibrillator",
+            "ICD check"
+          ],
+          "z_code": "Z95.810"
+        },
+        "coronary_stent": {
+          "triggers": [
+            "s/p stent",
+            "coronary stent",
+            "drug-eluting stent",
+            "s/p PCI"
+          ],
+          "z_code": "Z95.5"
+        },
+        "CABG": {
+          "triggers": [
+            "s/p CABG",
+            "coronary artery bypass",
+            "bypass graft"
+          ],
+          "z_code": "Z95.1"
+        },
+        "prosthetic_valve": {
+          "triggers": [
+            "prosthetic valve",
+            "mechanical valve",
+            "bioprosthetic valve"
+          ],
+          "z_code": "Z95.2"
+        },
+        "postoperative_aftercare": {
+          "triggers": [
+            "postoperative care",
+            "post-op",
+            "surgical aftercare",
+            "s/p surgery",
+            "s/p polypectomy",
+            "s/p procedure"
+          ],
+          "z_code": "Z48.89"
+        },
+        "foley_urethral_catheter": {
+          "triggers": [
+            "Foley catheter",
+            "Foley",
+            "Foley in place",
+            "urethral catheter",
+            "urethral urinary catheter in situ",
+            "indwelling catheter",
+            "chronic Foley",
+            "urinary catheter in place"
+          ],
+          "z_code": "Z97.8",
+          "description": "Presence of other specified devices — urethral catheter. Do NOT use Z93.6 (cystostomy) for Foley/urethral catheters."
+        },
+        "tracheostomy": {
+          "triggers": [
+            "tracheostomy",
+            "trach",
+            "tracheostomy status"
+          ],
+          "z_code": "Z93.0"
+        }
+      }
+    }
+  },
+  "STEP_4_meat_validation": {
+    "instruction": "For every extracted disease, find explicit MEAT evidence in the document. Do not assume. Do not fabricate. Quote verbatim or leave empty.",
+    "components": {
+      "M_monitor": {
+        "meaning": "Clinician is actively observing THIS condition over time.",
+        "valid_signals": [
+          "lab values ordered/reviewed to track THIS condition",
+          "vital signs linked to THIS condition",
+          "follow-up scheduled for THIS condition",
+          "symptom tracking documented for THIS condition"
+        ],
+        "invalid_signals": [
+          "generic vitals not linked to this disease",
+          "BMI for a non-weight condition",
+          "ECG for a non-cardiac condition"
+        ]
+      },
+      "E_evaluate": {
+        "meaning": "Clinician is actively investigating THIS condition through diagnostics.",
+        "valid_signals": [
+          "imaging ordered for THIS condition",
+          "labs ordered to characterize THIS condition",
+          "specialist referral for THIS condition",
+          "functional testing for THIS condition"
+        ],
+        "invalid_signals": [
+          "lipid panel for hypertension (wrong — lipids evaluate hyperlipidemia)",
+          "HbA1c for obesity (wrong — HbA1c evaluates diabetes)"
+        ]
+      },
+      "A_assess": {
+        "meaning": "Clinician has made active clinical judgment about THIS condition.",
+        "valid_signals": [
+          "condition named in Assessment or Plan",
+          "clinician comments: controlled/uncontrolled/stable/worsening/improved",
+          "condition named in clinical impression"
+        ],
+        "auto_rule": "Any condition explicitly named in Assessment = A is automatically satisfied. Quote the exact Assessment text."
+      },
+      "T_treat": {
+        "meaning": "A therapeutic intervention is actively being applied for THIS condition.",
+        "valid_signals": [
+          "specific medication on active list that treats THIS condition",
+          "new prescription or dose adjustment for THIS condition",
+          "procedure performed for THIS condition",
+          "device managed for THIS condition"
+        ],
+        "invalid_signals": [
+          "generic 'Medications' without naming the drug",
+          "'Procedures' without naming the procedure"
+        ]
+      }
+    },
+    "meat_grading": {
+      "Full MEAT": "4/4 components have explicit evidence",
+      "Medium MEAT": "3/4 components have explicit evidence",
+      "Half MEAT": "2/4 components have explicit evidence",
+      "Partial MEAT": "1/4 components — minimum threshold for ACTIVE. Z-codes with T only qualify here.",
+      "NO MEAT": "0/4 — condition MUST be moved to excluded_conditions"
+    },
+    "evidence_uniqueness_rule": "Each MEAT component must reference evidence specific to THAT disease only. Never reuse the same evidence string across multiple diseases."
+  },
+  "STEP_4A_mdm_activation_override": {
+    "purpose": "Medical Decision-Making (MDM) is the ultimate arbiter of whether a condition is codeable for this encounter. If a doctor spent cognitive effort on a condition — even if the patient declined treatment, or no new orders were placed — that condition influenced the visit's MDM complexity and IS billable.",
+    "golden_rule": "If the doctor made a DECISION about a condition during this encounter, that condition is ACTIVE — regardless of whether treatment was accepted, performed, or changed.",
+    "mdm_triggers": {
+      "instruction": "A condition qualifies as MDM-ACTIVE if ANY ONE of the following is true:",
+      "trigger_1_assessed_in_note": "The condition appears in the Assessment/Plan section — even as a one-liner like 'Overweight - discussed diet'.",
+      "trigger_2_discussed_with_patient": "The doctor documented a discussion about this condition — even if the patient declined intervention. Keywords: 'discussed', 'counseled', 'advised', 'recommended', 'offered', 'patient declined', 'patient prefers', 'deferred'.",
+      "trigger_3_data_reviewed": "The doctor reviewed labs, imaging, or prior test results related to this condition — even if no new orders were placed. Keywords: 'reviewed', 'noted', 'was normal in [year]', 'prior [test] showed', 'X-ray showed', 'labs were neg'.",
+      "trigger_4_referral_offered_or_declined": "The doctor offered a referral or specialist consultation related to this condition — even if the patient declined. Keywords: 'referred', 'offered to refer', 'declined to see', 'advised to schedule'.",
+      "trigger_5_clinical_reasoning_documented": "The doctor documented any clinical reasoning about this condition — risk assessment, differential diagnosis, watchful waiting rationale, or decision to defer treatment. Keywords: 'risk', 'given his history', 'we discussed', 'I offered', 'he prefers to', 'advised him to contact if'.",
+      "trigger_6_problem_list_with_any_mention": "The condition is on the Active Problem List AND is mentioned ANYWHERE in the note body (HPI, ROS, Physical Exam, Assessment) — even a single reference counts as MDM involvement.",
+      "trigger_7_physical_exam_finding": "The doctor documented an exam finding directly related to this condition (e.g., Limited ROM for tendinitis, deformity for arthritis, elevated BP reading for hypertension)."
+    },
+    "mdm_meat_floor": {
+      "instruction": "When a condition qualifies via MDM triggers but has low traditional MEAT evidence, apply a MEAT floor:",
+      "floor_rule": "MDM-activated conditions receive a MINIMUM meat_score of 1 (Partial MEAT). If traditional MEAT evidence gives a higher score, use the higher score.",
+      "meat_grade_annotation": "When a condition is activated primarily by MDM (not traditional MEAT), add 'MDM-activated' to the meat_grade_reasoning field to document why it was retained despite limited treatment evidence."
+    },
+    "mdm_does_NOT_activate": [
+      "A condition mentioned ONLY in Past Medical History with zero references anywhere else in the note",
+      "A condition mentioned ONLY in Family History that does NOT influence any clinical decision at this encounter",
+      "A condition explicitly documented as 'resolved', 'no longer active', or 'in remission' with no current monitoring",
+      "A condition that appears ONLY in Review of Systems as a NEGATIVE finding (e.g., 'Denies chest pain')"
+    ],
+    "examples": {
+      "example_1_declined_treatment": {
+        "scenario": "Patient has calcific tendinitis on Problem List. Doctor documents 'Limited ROM RUE sec to birth injury - Declined to see orthop'. Physical exam shows 'limited ROM RUE'.",
+        "mdm_triggers_fired": [
+          "trigger_6 (Problem List + mentioned in PE)",
+          "trigger_4 (referral offered/declined)",
+          "trigger_7 (exam finding documented)"
+        ],
+        "result": "ACTIVE — the doctor examined the condition AND offered referral. Patient declining treatment does NOT erase the MDM effort."
+      },
+      "example_2_labs_reviewed_no_action": {
+        "scenario": "Patient has finger joint deformity. Doctor documents X-ray findings (joint space narrowing, DJD), ESR/RF were neg, patient declined orthopedics.",
+        "mdm_triggers_fired": [
+          "trigger_3 (imaging and lab data reviewed)",
+          "trigger_4 (referral offered/declined)",
+          "trigger_7 (exam finding: deformity at tip)"
+        ],
+        "result": "ACTIVE — reviewing diagnostic data and offering referral IS medical decision-making."
+      },
+      "example_3_truly_historical": {
+        "scenario": "PMH lists 'appendectomy 2005'. Not mentioned in HPI, Assessment, or PE.",
+        "mdm_triggers_fired": [
+          "None"
+        ],
+        "result": "EXCLUDED — no MDM trigger fired. This is purely historical."
+      }
+    }
+  },
+  "STEP_5_icd10_coding": {
+    "instruction": "Assign the most specific ICD-10-CM code supported by documentation. Work through the specificity checklist before assigning.",
+    "universal_coding_principles": {
+      "principle_1_assessment_authority": "The Assessment/Plan section has the HIGHEST diagnostic authority. Any condition listed there is ACTIVE for this encounter. NEVER mark an Assessment item as resolved or historical. The Assessment words control the ICD code — NOT HPI, NOT problem list.",
+      "principle_2_code_what_is_written": "Code exactly what the clinician wrote. If the Assessment says 'sore throat', code pharyngitis (J02.9) — do NOT generalize to 'viral infection'. If it says 'back pain, unspecified', code M54.9 — do NOT infer lumbar from other sections. The written diagnosis text determines the code.",
+      "principle_3_specificity_from_documentation": "Always assign the most specific ICD-10-CM code that the documentation SUPPORTS. Check: type (1 vs 2), laterality (right/left/bilateral), chronicity (acute/chronic/acute-on-chronic), severity, complications. If a bilateral code exists (e.g., H92.03 for bilateral otalgia), use the single bilateral code — do NOT split into two laterality codes.",
+      "principle_4_separate_distinct_conditions": "When a document uses a slash to combine conditions (e.g., 'atrial fibrillation/flutter'), extract EACH as a SEPARATE disease with its OWN ICD code. When a heading contains sub-items, extract sub-items as separate conditions only if they have distinct ICD codes.",
+      "principle_5_history_vs_active": "Conditions described as 'history of [X]' in Assessment = Z85.x (cancer) or Z87.x (other) personal history codes. Conditions described as active/present in Assessment = active diagnosis codes. The verb and context determine which.",
+      "principle_6_device_status_codes": "Foley/urethral catheter = Z97.8 (NOT Z93.6 which is cystostomy). Tracheostomy = Z93.0. Pacemaker = Z95.0. Always extract BOTH the device status AND the underlying condition that caused it.",
+      "principle_7_etiology_manifestation": "When one active disease CAUSES another, use the combination/etiology-specific ICD code. DM + retinopathy = E11.319. HTN + CKD = I12.x. Do NOT code both separately when a combination code exists.",
+      "principle_8_sequela_suffix": "When Assessment explicitly says 'sequela' (e.g., 'aspiration, sequela'), the ICD code MUST include the 'S' 7th character suffix.",
+      "principle_9_same_family_multiple_codes": "A patient CAN have MULTIPLE codes from the same ICD-10 family or chapter. Examples: F11.20 (opioid dependence, uncomplicated) AND F11.288 (opioid dependence with other disorder) are TWO SEPARATE valid codes. E27.1 (primary adrenocortical insufficiency) AND E27.40 (unspecified adrenocortical insufficiency) are DIFFERENT conditions. E11.9 AND E11.649 are DIFFERENT diabetes manifestations. F41.1 (generalized anxiety) AND F41.8 (other anxiety) are DIFFERENT. NEVER skip a code just because another code from the same ICD chapter or subcategory already exists. Each documented condition gets its own code."
+    },
+    "specificity_checklist": [
+      "Type specified? (Type 1 vs 2, primary vs secondary, essential vs secondary hypertension)",
+      "Laterality documented? (right, left, bilateral — if ICD family requires it, two codes needed for bilateral)",
+      "Chronicity documented? (acute, chronic, acute-on-chronic)",
+      "Severity documented? (mild, moderate, severe, intractable)",
+      "Complication or manifestation documented?",
+      "Status documented? (controlled, uncontrolled, in remission, with exacerbation)"
+    ],
+    "causal_chain_rule": {
+      "instruction": "BEFORE assigning any unspecified code (ending in .9 or .0), check: Is this condition causally explained by another ACTIVE disease in this encounter? If yes, use the etiology-specific or combination code.",
+      "examples": [
+        "IDA in a patient with active UGIB → D50.8 (IDA secondary to blood loss) NOT D50.9 (unspecified)",
+        "Type 2 DM + retinopathy → E11.319 NOT H35.9 separately",
+        "Hypertension + CKD → I12.x combination code NOT I10 + N18.x separately",
+        "Hypertension + heart disease → I11.x combination code"
+      ],
+      "mechanism": "Scan all ACTIVE diseases in the current extraction. For each disease being coded, ask: Is any other active disease in this list the direct cause or a well-known complication driver of this one? If yes, upgrade specificity."
+    },
+    "anatomical_site_override": {
+      "instruction": "When a skin or soft tissue condition is at a specific anatomical site that has its OWN ICD-10 chapter, use the site-specific code.",
+      "eyelid": "Use H01.1xx (Eye chapter), NOT L-codes. Apply bilateral coding (two codes) if both eyes documented.",
+      "ear_canal": "Use H60.x or H61.x (Ear chapter), NOT L-codes.",
+      "oral_mucosa": "Use K13.x (Digestive chapter), NOT L-codes.",
+      "vulva_vagina": "Use N76.x or N77.x (Genitourinary chapter), NOT L-codes."
+    },
+    "bmi_supplementary_code_rule": {
+      "instruction": "When Overweight (E66.3) or any Obesity code (E66.0x, E66.1, E66.2, E66.8, E66.9) is extracted as an active disease, ALSO extract the corresponding BMI Z-code (Z68.x) if the patient's weight/height/BMI data is available in the document. Calculate BMI from weight and height if BMI is not explicitly stated. BMI ranges: Z68.1 (BMI 19.9 or less), Z68.20-Z68.29 (BMI 20.0-29.9, use specific 4th digit), Z68.30-Z68.39 (BMI 30.0-39.9), Z68.41-Z68.45 (BMI 40.0+). The BMI Z-code is an additional entry in the diseases array — it does NOT replace the E66.x code. Set is_zcode: true for the BMI entry.",
+      "calculation_note": "BMI = weight(kg) / height(m)^2. Convert lbs to kg by dividing by 2.205. Convert inches to meters by multiplying by 0.0254. ALWAYS compute the exact BMI value and round to 1 decimal place to determine the correct Z68.xx code. Z68.26 means BMI 26.0-26.9, Z68.27 means BMI 27.0-27.9, etc. If the document states the BMI value directly, use THAT value (do not recalculate). If the document provides weight and height, calculate precisely."
+    },
+    "active_problem_list_surveillance_rule": {
+      "instruction": "Conditions on the ACTIVE Problem List that have an active surveillance or follow-up plan documented ANYWHERE in the note (e.g., 'repeat colonoscopy in 5 years', 'follow-up in 3 months', 'continue monitoring') qualify as ACTIVE with at least Partial MEAT (the plan constitutes Treatment/Monitoring evidence). Do NOT exclude a condition as HISTORICAL if it remains on the Active Problem List AND has a documented future care plan at this encounter. This includes conditions like colon polyps with scheduled surveillance colonoscopy, even if the most recent test was negative."
+    },
+    "bilateral_coding_rule": {
+      "instruction": "If a condition affects BOTH sides of a paired structure, FIRST check if the ICD family has a dedicated bilateral code (e.g., H92.03 = bilateral otalgia, H01.12x = bilateral blepharitis). If a bilateral code exists, use the SINGLE bilateral code — do NOT create two separate laterality entries. ONLY create two entries (right + left) when no bilateral code exists in the ICD family.",
+      "signals": [
+        "both",
+        "bilateral",
+        "OU",
+        "AU",
+        "right and left",
+        "b/l",
+        "plural anatomical terms (eyelids, ears, knees)"
+      ]
+    },
+    "documentation_mismatch_flag": {
+      "instruction": "If the written disease name in the document does not match the clinical picture or the ICD-10 code it implies, do NOT silently code the wrong label. Instead flag it.",
+      "how_to_flag": "Set documentation_mismatch: true in the disease entry. Set mismatch_detail to explain: what is written vs what the clinical evidence suggests vs what was coded and why.",
+      "example": "Problem List says 'Generalized anxiety disorder' but actual ICD from billing data is F41.0 (Panic disorder). Flag: written label=GAD, clinical code=F41.0, action=coded F41.1 per written documentation, mismatch flagged for clinician review.",
+      "coding_action": "Code what is WRITTEN unless you have explicit contradicting clinical evidence within THIS document. If contradiction exists within the same document, code the Assessment text over the Problem List text — Assessment has higher authority."
+    }
+  },
+  "STEP_6_exclusion_logging": {
+    "instruction": "Every evaluated condition NOT classified as ACTIVE must be logged with exact reason.",
+    "cancer_history_override": "IMPORTANT: 'History of cancer', 'cancer in remission', 'h/o malignancy', 'status post cancer treatment' in the Assessment or Problem List must NEVER be excluded as HISTORICAL. Instead, extract as a Z85.x (personal history of malignant neoplasm) code with ACTIVE status. Cancer history documented in Assessment = active documentation = Z85.x code required.",
+    "exclusion_reasons": {
+      "HISTORICAL": "Appeared only in PMH or past history with no current MEAT evidence at this encounter.",
+      "FAMILY_HISTORY": "Condition belongs to a family member, not the patient, AND is not actively influencing clinical decisions at this encounter. If family history IS driving screening/surveillance/clinical decisions, extract as a Z80-Z84 code instead.",
+      "NEGATED": "Explicitly denied, ruled out, or documented as absent.",
+      "SYMPTOM_ONLY": "A symptom without a confirmed diagnosis (e.g., 'chest pain' when etiology is undetermined).",
+      "RESOLVED": "Explicitly documented as resolved, healed, cured, or no longer active.",
+      "NO_MEAT_EVIDENCE": "Condition mentioned but no Monitor, Evaluate, Assess, or Treat evidence found AND no MDM trigger from STEP_4A fired. If any MDM trigger fires (discussion, data review, referral offered, exam finding), the condition is ACTIVE despite low MEAT.",
+      "ENCOUNTER_NOT_RELEVANT": "Condition or Z-code exists but is not relevant to this specific encounter — Gate 2 of Z-code rule failed.",
+      "DOCUMENTATION_ONLY_LABEL": "Condition listed in a restricted section (Family/Social History) only."
+    }
+  },
+  "STEP_7_self_verification": {
+    "instruction": "Before writing JSON output, verify every item. If any check fails, fix it before outputting.",
+    "checklist": [
+      "SLASH-SPLIT CHECK: Did I find any condition written with a slash (/)? If yes, verify I created SEPARATE disease entries for EACH side of the slash. 'Atrial fibrillation/flutter' MUST produce both I48.91 AND I48.92 as separate entries. If I only have one entry for a slash-combined condition, FIX IT NOW by adding the missing entry.",
+      "UNDERLYING CONDITION CHECK: For every device/status Z-code (catheter, tracheostomy, etc.), did I also extract the UNDERLYING CONDITION that caused it? Example: Foley catheter (Z97.8) + urinary incontinence (R32) must BOTH appear.",
+      "ASSESSMENT COUNT: Count Assessment items. Count extracted Assessment diseases. Do they match exactly?",
+      "ASSESSMENT EXPANSION: Did I split category items into individual conditions (e.g., 'valve disease with MR and TR' → 2 entries)?",
+      "HALLUCINATION: For EACH disease, can I quote the EXACT line from the document? If not, remove it.",
+      "MEDICATION INFERENCE: Did I add any clinical diagnosis ONLY from a medication without it being named elsewhere? If yes, remove it. (Z-codes exempt.)",
+      "LAB INFERENCE: Did I add any disease ONLY from a lab value without it being named in Tier 1 or 2? If yes, remove it.",
+      "ZCODE GATE CHECK: For every Z-code extracted, did BOTH Gate 1 (medication qualifies) AND Gate 2 (encounter relevant) pass? If Gate 2 failed, move to excluded_conditions with ENCOUNTER_NOT_RELEVANT.",
+      "CAUSAL CHAIN CHECK: For every condition coded with an unspecified code (.9 or .0), did I check if another active disease causally explains it and warrants a more specific code?",
+      "DOCUMENTATION MISMATCH: Did I flag any condition where the written label and clinical evidence conflict?",
+      "BILATERAL CHECK: For any bilateral condition affecting paired structures requiring laterality, did I create two separate ICD entries?",
+      "ANATOMICAL SITE CHECK: For any skin condition at eyelid, ear, oral mucosa, or genitalia — did I use the correct chapter code?",
+      "MEAT COMPLETENESS: Does every ACTIVE disease have all 4 MEAT fields explicitly populated (even if empty string)?",
+      "MEAT THRESHOLD: Does every ACTIVE disease have meat_score >= 1? Any with score 0 must go to excluded_conditions. BUT first check STEP_4A MDM triggers — if any MDM trigger fires, the condition gets a floor of meat_score=1 and stays ACTIVE.",
+      "MEAT GRADE TERMS: Must be exactly 'Full MEAT', 'Medium MEAT', 'Half MEAT', or 'Partial MEAT'. No other variants.",
+      "EVIDENCE SPECIFICITY: Is every MEAT evidence string clinically specific to THAT disease only — not reused across diseases?",
+      "NO GENERIC EVIDENCE: Did I use 'Medications', 'Procedures', or 'Problem List' as evidence anywhere? Replace with specific names/quotes.",
+      "ABBREVIATION EXPANSION: Did I expand all abbreviations in disease names?",
+      "PRIMARY ACTIVATION BASIS: Does every disease have primary_activation_basis populated with a specific verbatim-quoted reason?",
+      "RESPIRATORY FAILURE ASSESSMENT CHECK: If I coded any respiratory failure (J96.xx), did I use the EXACT qualifier from the Assessment/Plan section? Go back and re-read the Assessment text for this condition. If Assessment says 'Acute respiratory failure' use J96.0x. If Assessment says 'Chronic respiratory failure' use J96.1x. If Assessment says 'Acute on chronic' use J96.2x. Do NOT use the HPI or Problem List qualifier — the Assessment/Plan text is the ONLY authority for respiratory failure type.",
+      "SAME-FAMILY CODE CHECK: Did I find multiple DISTINCT conditions from the same ICD family in the Assessment? Examples: two different types of anxiety (F41.1 + F41.8), two different opioid use codes (F11.20 + F11.288), two different adrenal conditions (E27.1 + E27.40), diabetes with a specific manifestation AND general (E11.9 + E11.649). If yes, verify I created SEPARATE entries for EACH. NEVER collapse same-family codes into one entry.",
+      "LATERALITY PAIR CHECK: Did I find any bilateral condition needing separate left/right codes (e.g., M25.551 right hip + M25.552 left hip)? Verify BOTH codes are present as separate entries."
+    ]
+  },
+  "STEP_8_output_format": {
+    "instruction": "Return ONLY raw valid JSON. No markdown. No backticks. No explanatory text before or after. Begin response with opening brace { and end with closing brace }.",
+    "schema": {
+      "document_orientation": {
+        "document_type": "Identified document type from STEP_0",
+        "encounter_context": "Verbatim quote of chief complaint or primary encounter reason",
+        "sections_found": [
+          "List of every section identified, in document order"
+        ],
+        "assessment_style": "How Assessment presents diagnoses",
+        "documentation_quality_notes": "Any documentation quality issues observed"
+      },
+      "summary": {
+        "total_diseases_considered": 0,
+        "total_active_diseases": 0,
+        "total_excluded": 0,
+        "total_icd10_assigned": 0,
+        "full_meat_count": 0,
+        "medium_meat_count": 0,
+        "half_meat_count": 0,
+        "partial_meat_count": 0,
+        "assessment_sourced": 0,
+        "problem_list_sourced": 0,
+        "pmh_sourced": 0,
+        "zcode_extracted": 0,
+        "zcodes_rejected_gate2": 0,
+        "documentation_mismatches_flagged": 0,
+        "causal_chain_upgrades": 0
+      },
+      "diseases": [
+        {
+          "index": 1,
+          "disease_name": "Full normalized clinical term with all documented qualifiers",
+          "active_status": "ACTIVE",
+          "meat_grade": "Full MEAT",
+          "meat_score": 4,
+          "priority_level": "1-Assessment | 2-ProblemList | 3-ZCode | 4-PMH | 5-HPI",
+          "source_section": "Primary section where disease was identified",
+          "all_sections_mentioned": [
+            "Every section where this disease or its evidence appears"
+          ],
+          "context_snippets": [
+            "Exact verbatim quote from Assessment or Plan if present",
+            "Exact verbatim quote from Problem List if present",
+            "Exact medication name and dose if present"
+          ],
+          "meat_validation": {
+            "M_monitor": "Exact verbatim quote showing monitoring evidence specific to this disease, or empty string",
+            "E_evaluate": "Exact verbatim quote showing evaluation evidence specific to this disease, or empty string",
+            "A_assess": "Exact verbatim quote from Assessment about this disease, or empty string",
+            "T_treat": "Exact medication name + dose or procedure name, or empty string",
+            "meat_score": 4,
+            "meat_grade": "Full MEAT",
+            "meat_grade_reasoning": "One sentence explaining why this grade — which components satisfied, which absent",
+            "primary_activation_basis": "ASSESS: Listed in Assessment as item #N — [exact quote]"
+          },
+          "icd10_code": "K92.0",
+          "icd10_description": "Gastrointestinal hemorrhage, unspecified",
+          "icd10_selection_reasoning": "Brief explanation of why this specific code was chosen over alternatives, including any causal chain logic or specificity decisions",
+          "causal_chain_applied": false,
+          "causal_chain_detail": "If true: explain which active disease caused specificity upgrade and how",
+          "is_zcode": false,
+          "zcode_gate1_passed": null,
+          "zcode_gate2_passed": null,
+          "documentation_mismatch": false,
+          "mismatch_detail": "If true: what is written vs what clinical evidence suggests vs what was coded and why",
+          "hcc_status": "YES | NO"
+        }
+      ],
+      "csv_ready_output": [
+        {
+          "Disease": "Full normalized clinical term",
+          "ICD_10_Code": "Code",
+          "Segment": "Assessment | Problem List | Medications | HPI | PMH",
+          "Monitor": "Verbatim monitoring evidence or Not documented",
+          "Evaluate": "Verbatim evaluation evidence or Not documented",
+          "Assess": "Verbatim assessment evidence or Not documented",
+          "Treatment": "Medication name + dose or procedure or Not documented",
+          "MEAT_Level": "Full MEAT | Medium MEAT | Half MEAT | Partial MEAT",
+          "Is_ZCode": "Yes | No",
+          "Causal_Chain_Applied": "Yes | No",
+          "Documentation_Mismatch": "Yes | No"
+        }
+      ],
+      "excluded_conditions": [
+        {
+          "term": "Exact condition text as written in document",
+          "reason_excluded": "HISTORICAL | FAMILY_HISTORY | NEGATED | SYMPTOM_ONLY | RESOLVED | NO_MEAT_EVIDENCE | ENCOUNTER_NOT_RELEVANT | DOCUMENTATION_ONLY_LABEL",
+          "source_section": "Section where it appeared",
+          "exclusion_reasoning": "One sentence clinical explanation"
+        }
+      ]
+    }
+  },
+  "usage_instructions": {
+    "how_to_use_this_prompt": "Replace the system_prompt field value into your API call as the system message. Then pass the clinical document text as the user message with this instruction: 'Extract all diagnoses from the following clinical document following all phases in order: STEP_0 (document orientation) → STEP_1 (section mapping) → STEP_2 (disease extraction) → STEP_3 (Z-code extraction with encounter gate) → STEP_4 (MEAT validation) → STEP_5 (ICD-10 coding with causal chain and mismatch detection) → STEP_6 (exclusion logging) → STEP_7 (self-verification) → STEP_8 (JSON output). Do not skip any step. Document: [PASTE CLINICAL NOTE HERE]'",
+    "model_recommendation": "Use claude-sonnet-4-20250514 or claude-opus-4-20250514. Set max_tokens to at least 4000 for complex multi-condition documents.",
+    "key_improvements_over_v1": [
+      "Z-code two-gate rule: prevents mechanical Z-code extraction for irrelevant encounters",
+      "Causal chain rule: forces D50.8 over D50.9 when UGIB is active; forces combination codes for DM+complications, HTN+CKD",
+      "Documentation mismatch detection: flags when written label conflicts with clinical evidence instead of silently miscoding",
+      "Dynamic document reading (STEP_0): adapts extraction strategy to document type — outpatient vs inpatient vs ED vs procedure note",
+      "encounter_context anchor: every decision is checked against the primary reason for THIS visit",
+      "Assessment authority over Problem List: when conflict exists, Assessment text wins",
+      "zcodes_rejected_gate2 counter in summary: tracks how many Z-codes were correctly suppressed"
+    ]
+  }
+}

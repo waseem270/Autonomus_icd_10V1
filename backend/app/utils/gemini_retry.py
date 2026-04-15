@@ -164,12 +164,36 @@ async def call_gemini(
     config: Any,
 ) -> Any:
     """
-    Call Gemini generate_content with circuit breaker, rate-limiting,
-    and automatic retry.
+    Call LLM generate_content with circuit breaker, rate-limiting,
+    and automatic retry.  Routes to OpenAI or Gemini based on LLM_PROVIDER.
 
     Raises the original exception after ``GEMINI_MAX_RETRIES`` attempts
     so callers can decide what to do (instead of silently returning None).
     """
+    from ..core.config import get_llm_provider, get_active_model
+
+    provider = get_llm_provider()
+
+    if provider == "openai":
+        # Route to OpenAI — no circuit breaker / rate limiter needed
+        # (OpenAI has its own rate limiting and the SDK handles retries)
+        from .llm_provider import call_openai
+        active_model = get_active_model()
+        response = await call_openai(
+            model=active_model,
+            contents=contents,
+            config=config,
+        )
+        from .token_tracker import token_tracker
+        if response and getattr(response, "usage_metadata", None):
+            token_tracker.add_usage(
+                model=active_model,
+                prompt_tokens=getattr(response.usage_metadata, "prompt_token_count", 0) or 0,
+                completion_tokens=getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            )
+        return response
+
+    # Default: Gemini path
     # Fast-fail if a previous call already proved Gemini is down
     circuit_breaker.check()
 
@@ -182,6 +206,16 @@ async def call_gemini(
         )
         # Success — close the circuit if it was open
         circuit_breaker.reset()
+        
+        # Track Tokens
+        from .token_tracker import token_tracker
+        if response and getattr(response, "usage_metadata", None):
+            token_tracker.add_usage(
+                model=model,
+                prompt_tokens=getattr(response.usage_metadata, "prompt_token_count", 0) or 0,
+                completion_tokens=getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            )
+            
         return response
     except Exception as exc:
         # If this is a retryable error and we're about to exhaust retries,
@@ -201,11 +235,13 @@ async def call_gemini_safe(
     Top-level wrapper that trips the circuit breaker after retries exhaust.
     Use this instead of call_gemini directly.
     """
+    from ..core.config import get_llm_provider
+
+    provider = get_llm_provider()
+
     try:
         return await call_gemini(client, model, contents, config)
     except Exception as exc:
-        if _is_retryable_error(exc):
+        if provider != "openai" and _is_retryable_error(exc):
             circuit_breaker.trip(exc)
         raise
-    finally:
-        gemini_rate_limiter.release()

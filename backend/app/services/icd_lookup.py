@@ -121,7 +121,25 @@ DISEASE_SYNONYMS: Dict[str, List[str]] = {
     "type 2 diabetes mellitus": ["type 2 diabetes mellitus without complications"],
     "diabetes mellitus type 1": ["type 1 diabetes mellitus"],
     "type 1 diabetes": ["type 1 diabetes mellitus"],
-    "atherosclerosis": ["atherosclerosis of aorta"],
+    "atherosclerosis": ["unspecified atherosclerosis", "atherosclerosis of aorta"],
+    "atherosclerotic disease": ["unspecified atherosclerosis"],
+    "asvd": ["unspecified atherosclerosis"],
+    "elevated blood pressure": ["elevated blood-pressure reading, without diagnosis of hypertension"],
+    "elevated bp": ["elevated blood-pressure reading, without diagnosis of hypertension"],
+    "elevated blood pressure reading": ["elevated blood-pressure reading, without diagnosis of hypertension"],
+    "high blood pressure reading": ["elevated blood-pressure reading, without diagnosis of hypertension"],
+    "otalgia": ["otalgia, unspecified ear"],
+    "ear pain": ["otalgia, unspecified ear"],
+    "earache": ["otalgia, unspecified ear"],
+    "otalgia bilateral": ["otalgia, bilateral"],
+    "bilateral ear pain": ["otalgia, bilateral"],
+    "bilateral otalgia": ["otalgia, bilateral"],
+    "acute pharyngitis": ["acute pharyngitis, unspecified"],
+    "pharyngitis": ["acute pharyngitis, unspecified"],
+    "sore throat": ["acute pharyngitis, unspecified"],
+    "strep throat": ["streptococcal pharyngitis"],
+    "history of malignant neoplasm of bladder": ["personal history of malignant neoplasm of bladder"],
+    "personal history of bladder cancer": ["personal history of malignant neoplasm of bladder"],
     "secondary diabetes mellitus": ["diabetes mellitus due to underlying condition"],
     "secondary diabetes": ["diabetes mellitus due to underlying condition"],
     "glaucoma": ["unspecified glaucoma"],
@@ -245,6 +263,28 @@ DISEASE_SYNONYMS: Dict[str, List[str]] = {
     "overactive bladder": ["overactive bladder"],
     "erectile dysfunction": ["erectile dysfunction, unspecified"],
     "hypothyroidism unspecified": ["hypothyroidism, unspecified"],
+    # ── Symptom codes ─────────────────────────────────────────────────
+    "nausea": ["nausea"],
+    "vomiting": ["nausea with vomiting, unspecified"],
+    "nausea and vomiting": ["nausea with vomiting, unspecified"],
+    "dysuria": ["dysuria"],
+    "polyp of colon": ["polyp of colon"],
+    "colon polyp": ["polyp of colon"],
+    "colonic polyp": ["polyp of colon"],
+    # ── Family history codes ──────────────────────────────────────────
+    "family history of colon cancer": ["family history of malignant neoplasm of digestive organs"],
+    "family history of malignant neoplasm": ["family history of malignant neoplasm of digestive organs"],
+    "family history colon cancer": ["family history of malignant neoplasm of digestive organs"],
+    # ── History of neoplasm (unspecified site) ─────────────────────────
+    "history of throat cancer": ["personal history of malignant neoplasm of other parts of lip, oral cavity, and pharynx"],
+    "history of laryngeal cancer": ["personal history of malignant neoplasm of other parts of lip, oral cavity, and pharynx"],
+    "history of head and neck cancer": ["personal history of malignant neoplasm of other parts of lip, oral cavity, and pharynx"],
+    "personal history of throat cancer": ["personal history of malignant neoplasm of other parts of lip, oral cavity, and pharynx"],
+    # ── Dermatitis / eyelid conditions ────────────────────────────────
+    "dermatitis of eyelid": ["unspecified dermatitis of eyelid"],
+    "eyelid dermatitis": ["unspecified dermatitis of eyelid"],
+    "allergic dermatitis of eyelid": ["allergic dermatitis of eyelid"],
+    "contact dermatitis of eyelid": ["allergic dermatitis of eyelid"],
 }
 
 
@@ -324,7 +364,7 @@ class ICDLookupService:
             return None
 
         query = """
-        SELECT code, description 
+        SELECT code, description, hcc_status
         FROM icd10_codes 
         WHERE LOWER(description) = LOWER(?)
         LIMIT 1
@@ -360,6 +400,7 @@ class ICDLookupService:
                     return {
                         "icd_code": format_icd_code(result[0]),
                         "description": result[1],
+                        "hcc_status": result[2] if len(result) > 2 else "Non-HCC",
                         "match_type": "exact",
                         "confidence": 1.0
                     }
@@ -413,14 +454,14 @@ class ICDLookupService:
         try:
             cursor = conn.cursor()
             seen_codes: Set[str] = set()
-            candidates: List[tuple] = []
+            candidates: List[tuple] = []  # (code, description, hcc_status)
             
             for variant in search_variants:
                 variant_words = _extract_search_words(variant)
                 
                 # ── Strategy 1: Full phrase LIKE ──
                 phrase_query = """
-                SELECT code, description FROM icd10_codes
+                SELECT code, description, hcc_status FROM icd10_codes
                 WHERE LOWER(description) LIKE LOWER(?)
                 LIMIT 200
                 """
@@ -436,7 +477,7 @@ class ICDLookupService:
                         [f"LOWER(description) LIKE ?" for _ in variant_words]
                     )
                     and_query = f"""
-                    SELECT code, description FROM icd10_codes
+                    SELECT code, description, hcc_status FROM icd10_codes
                     WHERE {where_clauses}
                     LIMIT 500
                     """
@@ -452,7 +493,7 @@ class ICDLookupService:
                 if len(word) < 4:
                     continue
                 word_query = """
-                SELECT code, description FROM icd10_codes
+                SELECT code, description, hcc_status FROM icd10_codes
                 WHERE LOWER(description) LIKE LOWER(?)
                 LIMIT 100
                 """
@@ -466,7 +507,9 @@ class ICDLookupService:
             
             # ── Score all candidates with improved scoring ──
             scored_results = []
-            for code, description in candidates:
+            for row in candidates:
+                code, description = row[0], row[1]
+                row_hcc = row[2] if len(row) > 2 else "Non-HCC"
                 desc_lower = _strip_diacritics(description).lower()
                 
                 # Primary: token_set_ratio (handles token subsets well)
@@ -595,6 +638,7 @@ class ICDLookupService:
                     scored_results.append({
                         "icd_code": format_icd_code(code),
                         "description": description,
+                        "hcc_status": row_hcc,
                         "match_type": "fuzzy",
                         "confidence": capped_conf,
                         "similarity_score": score  # raw score for sorting
@@ -668,7 +712,7 @@ class ICDLookupService:
         if not conn:
             return None
 
-        query = "SELECT code, description FROM icd10_codes WHERE code = ? LIMIT 1"
+        query = "SELECT code, description, hcc_status FROM icd10_codes WHERE code = ? LIMIT 1"
         try:
             cursor = conn.cursor()
             cursor.execute(query, (icd_code,))
@@ -676,7 +720,11 @@ class ICDLookupService:
             conn.close()
             
             if result:
-                return {"icd_code": format_icd_code(result[0]), "description": result[1]}
+                return {
+                    "icd_code": format_icd_code(result[0]),
+                    "description": result[1],
+                    "hcc_status": result[2] if len(result) > 2 else "Non-HCC"
+                }
             return None
         except Exception as e:
             self.logger.error(f"Code lookup failed: {e}")

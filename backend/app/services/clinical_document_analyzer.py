@@ -87,8 +87,17 @@ def _abbreviation_aware_match(candidate: str, existing_names: set) -> bool:
       "ckd 3"  matches  "chronic kidney disease stage 3"
       "htn"    matches  "essential hypertension"
       "dm2"    matches  "type 2 diabetes mellitus"
+    Also uses word-overlap matching so that:
+      "pressure injury of skin of right buttock"  matches  "pressure injury of right buttock"
     """
     cand_keys = _normalise_for_match(candidate)
+
+    # Extract significant words (>=4 chars) for overlap matching
+    _STOP_WORDS = {"with", "from", "that", "this", "type", "stage", "grade", "unspecified", "specified"}
+    def _sig_words(text: str) -> set:
+        return {w for w in re.findall(r"[a-z]{4,}", text.lower()) if w not in _STOP_WORDS}
+
+    cand_sig = _sig_words(candidate)
 
     for existing in existing_names:
         # Fast substring check (original behaviour)
@@ -96,11 +105,19 @@ def _abbreviation_aware_match(candidate: str, existing_names: set) -> bool:
             return True
         # Abbreviation-expanded check
         exist_keys = _normalise_for_match(existing)
-        # If any normalised key from the candidate appears inside any
-        # normalised key of the existing disease (or vice versa) → match.
         for ck in cand_keys:
             for ek in exist_keys:
                 if ck in ek or ek in ck:
+                    return True
+        # Word-overlap check: if >=70% of significant words overlap,
+        # these are the same condition (e.g. "pressure injury of skin of
+        # right buttock" vs "pressure injury of right buttock stage 3")
+        if cand_sig:
+            exist_sig = _sig_words(existing)
+            if exist_sig:
+                overlap = cand_sig & exist_sig
+                smaller = min(len(cand_sig), len(exist_sig))
+                if smaller > 0 and len(overlap) / smaller >= 0.70:
                     return True
     return False
 
@@ -225,7 +242,9 @@ class ClinicalDocumentAnalyzer:
         self.logger = logging.getLogger(__name__)
         self._prompt_path = Path(__file__).resolve().parents[2] / "prompt.json"
         self._client = None
-        self.model_name = settings.GEMINI_MODEL
+        # Use active model (OpenAI or Gemini)
+        from ..core.config import get_active_model
+        self.model_name = get_active_model()
         self.logger.info(
             f"ClinicalDocumentAnalyzer initialized with model: {self.model_name}"
         )
@@ -238,10 +257,17 @@ class ClinicalDocumentAnalyzer:
 
     @property
     def client(self):
-        """Lazy-init Gemini client on first use."""
+        """Lazy-init LLM client on first use. Returns a sentinel for OpenAI."""
         if self._client is None:
-            from ..core.config import create_genai_client
-            self._client = create_genai_client()
+            from ..core.config import get_llm_provider, create_genai_client, create_openai_client
+            provider = get_llm_provider()
+            if provider == "openai":
+                # OpenAI calls go through llm_provider, not the client directly.
+                # Return a sentinel so `if not self.client` checks pass.
+                oai = create_openai_client()
+                self._client = oai if oai else "__openai_sentinel__"
+            else:
+                self._client = create_genai_client()
         return self._client
 
     def _parse_json_robust(self, text: str) -> dict:
@@ -353,13 +379,17 @@ class ClinicalDocumentAnalyzer:
         except Exception:
             pass
 
+        model_name = (settings.GEMINI_MODEL or "").lower()
+        # Gemini 3 Pro requires thinking mode; budget 0 is invalid for those models.
+        thinking_budget = 1024 if ("gemini-3" in model_name and "pro" in model_name) else 0
+
         return types.GenerateContentConfig(
             temperature=settings.GEMINI_TEMPERATURE,
             top_p=settings.GEMINI_TOP_P,
             max_output_tokens=max(settings.GEMINI_MAX_TOKENS, 16384),
             response_mime_type="application/json",
             response_schema=_ANALYSIS_RESPONSE_SCHEMA,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
             safety_settings=SAFETY_SETTINGS,
             system_instruction=system_instr,
         )
@@ -624,11 +654,19 @@ class ClinicalDocumentAnalyzer:
             # Post-LLM evidence quality: deduplicate and strip generic evidence
             result = self._deduplicate_meat_evidence(result)
 
+            # Strict evidence validation — reject MEAT entries without real evidence
+            result = self._strict_evidence_validation(result, raw_text)
+
             # Approach 10: Remove diseases with NO MEAT after all cleaning
+            # EXCEPTION: Z68.x (BMI) codes are supplementary codes that
+            # accompany an obesity/overweight diagnosis and do not require
+            # independent MEAT evidence.
             diseases = result.get("diseases", [])
             active_diseases = []
             for d in diseases:
-                if d.get("meat_score", 0) >= 1:
+                icd = d.get("icd10_code") or ""
+                is_bmi_supplementary = icd.startswith("Z68.")
+                if d.get("meat_score", 0) >= 1 or is_bmi_supplementary:
                     active_diseases.append(d)
                 else:
                     result.setdefault("excluded_conditions", []).append({
@@ -642,6 +680,10 @@ class ClinicalDocumentAnalyzer:
                         ),
                     })
             result["diseases"] = active_diseases
+
+            # Deterministic correction: Respiratory failure type must match
+            # Assessment text, not HPI or Problem List wording
+            result = self._correct_resp_failure_from_assessment(raw_text, result)
 
             # Deterministic safety net: catch any Assessment items the LLM missed
             # or that were removed by evidence stripping above
@@ -676,6 +718,87 @@ class ClinicalDocumentAnalyzer:
 
     # ------------------------------------------------------------------
     # Post-LLM Assessment coverage verifier
+    # ------------------------------------------------------------------
+    # Deterministic correction: Respiratory failure type from Assessment
+    # ------------------------------------------------------------------
+
+    _RESP_FAILURE_RE = re.compile(
+        r"(?:acute\s+(?:on\s+chronic\s+)?(?:hypoxic\s+|hypercapnic\s+|hypoxic\s+and\s+hypercapnic\s+)?"
+        r"respiratory\s+failure|"
+        r"chronic\s+(?:hypoxic\s+|hypercapnic\s+)?respiratory\s+failure)",
+        re.IGNORECASE,
+    )
+
+    def _correct_resp_failure_from_assessment(
+        self, raw_text: str, result: dict
+    ) -> dict:
+        """
+        If the LLM coded respiratory failure (J96.xx), verify the type
+        matches the Assessment/Plan text.  The Assessment wording is
+        authoritative: 'Acute respiratory failure' → J96.0x, 'Chronic' →
+        J96.1x, 'Acute on chronic' → J96.2x.
+        """
+        # Extract the Assessment/Plan section
+        text_lower = raw_text.lower()
+        assessment_start = -1
+        for marker in ["assessment and plan", "assessment/plan", "assessment & plan",
+                        "assessment\n", "a/p\n", "a/p:"]:
+            idx = text_lower.rfind(marker)
+            if idx > assessment_start:
+                assessment_start = idx
+
+        if assessment_start < 0:
+            return result
+
+        assessment_text = text_lower[assessment_start:]
+
+        # Find all respiratory failure mentions in Assessment
+        matches = list(self._RESP_FAILURE_RE.finditer(assessment_text))
+        if not matches:
+            return result
+
+        # Determine the type from Assessment
+        for m in matches:
+            phrase = m.group(0).lower()
+            if "acute on chronic" in phrase or "acute-on-chronic" in phrase:
+                correct_prefix = "J96.2"
+            elif "chronic" in phrase and "acute" not in phrase:
+                correct_prefix = "J96.1"
+            elif "acute" in phrase:
+                correct_prefix = "J96.0"
+            else:
+                continue
+
+            # Now check diseases for mismatched respiratory failure codes
+            for disease in result.get("diseases", []):
+                icd = disease.get("icd10_code") or ""
+                if not icd.startswith("J96."):
+                    continue
+
+                current_prefix = icd[:5]  # e.g., "J96.0", "J96.1", "J96.2"
+                if current_prefix != correct_prefix:
+                    # Determine the correct suffix (hypoxia/hypercapnia)
+                    suffix = icd[5:] if len(icd) > 5 else "1"  # default to hypoxia
+                    new_code = correct_prefix + suffix
+                    self.logger.info(
+                        f"Resp failure correction: Assessment says '{phrase}' "
+                        f"→ changing {icd} to {new_code}"
+                    )
+                    disease["icd10_code"] = new_code
+                    old_name = disease.get("disease_name", "")
+                    # Also fix the disease name
+                    if correct_prefix == "J96.0":
+                        disease["disease_name"] = re.sub(
+                            r"(?i)acute\s+on\s+chronic", "Acute", old_name
+                        )
+                    elif correct_prefix == "J96.1":
+                        disease["disease_name"] = re.sub(
+                            r"(?i)acute\s+on\s+chronic", "Chronic", old_name
+                        )
+            break  # Use first Assessment match
+
+        return result
+
     # ------------------------------------------------------------------
 
     def _verify_assessment_coverage(self, raw_text: str, result: dict) -> dict:
@@ -737,6 +860,8 @@ class ClinicalDocumentAnalyzer:
                 "today", "currently", "recommend", "discussed", "plan", "need",
                 "would", "could", "may", "might", "has", "had", "was", "were",
                 "are", "been", "being", "have", "does", "did", "can",
+                # Also exclude common Assessment sub-headers and comment prefixes
+                "comments", "orders", "diagnoses", "referral", "ambulatory",
             }
             for line in plain_lines:
                 first_word = line.split()[0].lower().rstrip(",:;")
@@ -746,11 +871,23 @@ class ClinicalDocumentAnalyzer:
         if not items:
             return result
 
-        # Build a set of already-captured active disease names (lowercase)
+        # Build a set of already-captured disease names (lowercase)
+        # Include ALL diseases (not just ACTIVE) to avoid re-adding excluded ones
         existing_names = {
             d.get("disease_name", "").lower().strip()
             for d in result.get("diseases", [])
-            if d.get("active_status", "").upper() == "ACTIVE"
+        }
+        # Also include excluded conditions to avoid resurresting them
+        for exc in result.get("excluded_conditions", []):
+            term = exc.get("term", "").lower().strip()
+            if term:
+                existing_names.add(term)
+
+        # Track existing ICD codes to prevent duplicate coding via different names
+        existing_icds = {
+            d.get("icd10_code", "").strip().upper()
+            for d in result.get("diseases", [])
+            if d.get("icd10_code", "").strip()
         }
 
         skip_first_words = {
@@ -758,6 +895,43 @@ class ClinicalDocumentAnalyzer:
             "return", "review", "continue", "discuss", "monitoring", "education",
             "discussed", "informed", "counseled", "labs", "imaging",
         }
+
+        # Patterns that are NOT diseases — vaccines, lab orders, etc.
+        _NON_DISEASE_RE = re.compile(
+            r"(?i)(?:vaccine|vaccination|immunization|immunized|DTaP|MMR|IPV|Hep\s*[AB]|PENTACEL|INFANRIX|Rotavirus|Poliovirus|Pneumococcal|Varicella|PCV13|PROQUAD|ACTHIB|HAVRIX|VAQTA|IPOL|ROTATEQ|VARIVAX|^CBC|^CMP|^Comprehensive Metabolic|^Iron Profile|^MRI\b|^CT\b|^X-ray|^Ultrasound|^Answers submitted|^Overview$|^Blood pressure today|^Advised him|^ACE inhibitor|^VNA nursing|^Improvement or symptoms|^Still unclear)"
+        )
+
+        # Stable/not-managed conditions: items that are just listed with
+        # "stable", "continue", "no change" annotations should not be added
+        # by the coverage verifier — they are not actively managed this visit.
+        _STABLE_ONLY_RE = re.compile(
+            r"(?i)(?:^|\s*[-–—:,]\s*)"
+            r"(?:stable|well\s+controlled|controlled|unchanged|"
+            r"continue\s+(?:current|same|home)\s+(?:meds|medications?|regimen|treatment)|"
+            r"no\s+change|at\s+goal|resolved|quiescent|"
+            r"not\s+active|no\s+acute\s+issues?|asymptomatic|"
+            r"no\s+(?:new\s+)?(?:symptoms?|complaints?|concerns?)|"
+            r"doing\s+well|improved|improving|"
+            r"noted\s+on\s+(?:colonoscopy|imaging|ct|mri|x-ray))"
+            r"(?:\s*$|\s*[,;.])",
+        )
+
+        # Background/incidental phrases that should not be added by verifier
+        # unless encounter-level management action is explicitly documented.
+        # Only truly generic terms — NOT specific disease names.
+        _BACKGROUND_OR_INCIDENTAL_RE = re.compile(
+            r"(?i)\b(?:incidental|old\s+finding|stable\s+from\s+prior|"
+            r"chronic\s+appearing|degenerative)\b"
+        )
+        _ACTIONABLE_RE = re.compile(
+            r"(?i)\b(?:start|started|initiat|prescrib|adjust|increase|decrease|"
+            r"taper|stop|discontinu|hold|order|follow\s*up|f/?u|monitor|"
+            r"recheck|refer|discuss|counsel|reviewed|evaluat|treat|therapy|plan)\b"
+        )
+        _ORDER_ONLY_RE = re.compile(
+            r"(?i)\b(?:future|profile|panel|order(?:ed)?|test(?:ing)?|ige|"
+            r"lab\s+order|screening\s+order)\b"
+        )
 
         next_idx = max(
             (d.get("index", 0) for d in result.get("diseases", [])), default=0
@@ -771,6 +945,31 @@ class ClinicalDocumentAnalyzer:
             if item_clean.split()[0].lower() in skip_first_words:
                 continue
             if self._is_non_disease_phrase(item_clean):
+                continue
+            if _NON_DISEASE_RE.search(item_clean):
+                continue
+            # Skip stable/not-managed items — they are listed but not actively
+            # addressed this visit. E.g. "HTN - stable, continue current meds"
+            if _STABLE_ONLY_RE.search(item_text):
+                self.logger.debug(
+                    f"Assessment verifier: skipping stable/not-managed item '{item_clean}'"
+                )
+                continue
+
+            # Skip order-only testing/allergy workup lines that are not
+            # diagnoses (e.g. "Allergy profile IgE; Future").
+            if _ORDER_ONLY_RE.search(item_clean) and not _ACTIONABLE_RE.search(item_clean):
+                self.logger.debug(
+                    f"Assessment verifier: skipping order-only item '{item_clean}'"
+                )
+                continue
+
+            # Skip chronic/incidental background items unless there is explicit
+            # encounter-level management action in the line.
+            if _BACKGROUND_OR_INCIDENTAL_RE.search(item_clean) and not _ACTIONABLE_RE.search(item_clean):
+                self.logger.debug(
+                    f"Assessment verifier: skipping background/incidental item '{item_clean}'"
+                )
                 continue
 
             norm = item_clean.lower().strip()
@@ -792,6 +991,13 @@ class ClinicalDocumentAnalyzer:
                         icd_desc = best.get("description", "")
                 except Exception:
                     pass
+
+            # Skip if this ICD code was already captured by the LLM
+            if icd_code and icd_code.upper() in existing_icds:
+                self.logger.debug(
+                    f"Assessment verifier: skipping '{item_clean}' — ICD {icd_code} already present"
+                )
+                continue
             new_entries.append({
                 "index": next_idx,
                 "disease_name": item_clean,
@@ -799,8 +1005,8 @@ class ClinicalDocumentAnalyzer:
                 "meat_grade": "Partial MEAT",
                 "meat_score": 1,
                 "priority_level": "1-Assessment",
-                "source_section": "Assessment",
-                "all_sections_mentioned": ["Assessment"],
+                "source_section": "Assessment_and_Plan",
+                "all_sections_mentioned": ["Assessment_and_Plan"],
                 "context_snippets": [item_clean],
                 "meat_validation": {
                     "M_monitor": "",
@@ -828,7 +1034,138 @@ class ClinicalDocumentAnalyzer:
             )
             result.setdefault("diseases", []).extend(new_entries)
 
+        # ── BMI supplement code (Z68.x) ─────────────────────────────────
+        # When E66.x (overweight/obesity) is coded and a BMI value appears
+        # in the document, add the appropriate Z68.x supplementary code.
+        existing_icds_final = {
+            (d.get("icd10_code") or "").strip().upper()
+            for d in result.get("diseases", [])
+            if (d.get("icd10_code") or "").strip()
+        }
+        has_e66 = any(icd.startswith("E66") for icd in existing_icds_final)
+        has_z68 = any(icd.startswith("Z68") for icd in existing_icds_final)
+
+        if has_e66 and not has_z68:
+            bmi_match = re.search(
+                r'\b(?:BMI|Body\s+Mass\s+Index)\s*(?:of\s*|:\s*|=\s*|is\s*|>\s*)?'
+                r'(\d{2,3}(?:\.\d+)?)',
+                raw_text, re.IGNORECASE,
+            )
+            # Fallback: extract BMI from disease names (LLM often includes it)
+            if not bmi_match:
+                for d in result.get("diseases", []):
+                    dname = d.get("disease_name", "")
+                    bmi_match = re.search(
+                        r'(?:BMI|body\s+mass\s+index)\s*(?:of\s*|:\s*|=\s*|is\s*)?'
+                        r'(\d{2,3}(?:\.\d+)?)',
+                        dname, re.IGNORECASE,
+                    )
+                    if bmi_match:
+                        break
+            if bmi_match:
+                bmi_val = float(bmi_match.group(1))
+                z68_code = self._bmi_to_z68(bmi_val)
+                if z68_code and z68_code not in existing_icds_final:
+                    next_idx += 1
+                    bmi_phrase = f"BMI {bmi_val}"
+                    result.setdefault("diseases", []).append({
+                        "index": next_idx,
+                        "disease_name": bmi_phrase,
+                        "active_status": "ACTIVE",
+                        "meat_grade": "Partial MEAT",
+                        "meat_score": 1,
+                        "priority_level": "1-Assessment",
+                        "source_section": "Assessment_and_Plan",
+                        "all_sections_mentioned": ["Assessment_and_Plan"],
+                        "context_snippets": [bmi_phrase],
+                        "meat_validation": {
+                            "M_monitor": "",
+                            "E_evaluate": bmi_match.group(0),
+                            "A_assess": bmi_phrase,
+                            "T_treat": "",
+                            "meat_score": 2,
+                            "meat_grade": "Partial MEAT",
+                            "meat_grade_reasoning": (
+                                "BMI supplement code paired with E66.x obesity/overweight."
+                            ),
+                            "primary_activation_basis": f"EVAL: {bmi_match.group(0)}",
+                        },
+                        "icd10_code": z68_code,
+                        "icd10_description": f"Body mass index [BMI] {bmi_val}",
+                        "icd10_selection_reasoning": "Deterministic BMI supplement code.",
+                        "hcc_status": "",
+                    })
+                    self.logger.warning(
+                        f"BMI supplement code added: {bmi_phrase} -> {z68_code}"
+                    )
+
+        # ── Personal / family history Z-codes ───────────────────────────
+        _history_patterns = [
+            (re.compile(r"(?i)\b(?:personal\s+)?history\s+of\s+(?:\w+\s+)*?"
+                        r"(?:cancer|carcinoma|malignant\s+neoplasm|malignancy|lymphoma|"
+                        r"leukemia|melanoma|sarcoma)\b"),
+             "Z85.819", "Personal history of malignant neoplasm, unspecified"),
+        ]
+        for hpat, hcode, hdesc in _history_patterns:
+            if hcode in existing_icds_final:
+                continue
+            hm = hpat.search(assessment_text)
+            if hm:
+                next_idx += 1
+                hphrase = hm.group(0).strip()
+                result.setdefault("diseases", []).append({
+                    "index": next_idx,
+                    "disease_name": hphrase,
+                    "active_status": "ACTIVE",
+                    "meat_grade": "Partial MEAT",
+                    "meat_score": 1,
+                    "priority_level": "1-Assessment",
+                    "source_section": "Assessment_and_Plan",
+                    "all_sections_mentioned": ["Assessment_and_Plan"],
+                    "context_snippets": [hphrase],
+                    "meat_validation": {
+                        "M_monitor": "",
+                        "E_evaluate": "",
+                        "A_assess": hphrase,
+                        "T_treat": "",
+                        "meat_score": 1,
+                        "meat_grade": "Partial MEAT",
+                        "meat_grade_reasoning": "History code deterministic match.",
+                        "primary_activation_basis": f"ASSESS: {hphrase}",
+                    },
+                    "icd10_code": hcode,
+                    "icd10_description": hdesc,
+                    "icd10_selection_reasoning": "Deterministic history code pattern.",
+                    "hcc_status": "",
+                })
+                existing_icds_final.add(hcode)
+                self.logger.warning(
+                    f"History Z-code fallback added: {hphrase} -> {hcode}"
+                )
+
         return result
+
+    # ------------------------------------------------------------------
+    # BMI value → Z68.x ICD code mapping
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _bmi_to_z68(bmi: float) -> str:
+        """Map a BMI numeric value to the appropriate Z68.x ICD-10 code."""
+        if bmi < 20:
+            return "Z68.1"
+        elif bmi < 40:
+            return f"Z68.{int(bmi)}"
+        elif bmi < 45:
+            return "Z68.41"
+        elif bmi < 50:
+            return "Z68.42"
+        elif bmi < 60:
+            return "Z68.43"
+        elif bmi < 70:
+            return "Z68.44"
+        elif bmi >= 70:
+            return "Z68.45"
+        return ""
 
     # ------------------------------------------------------------------
     # Post-LLM MEAT evidence deduplication and quality enforcement
@@ -965,6 +1302,154 @@ class ClinicalDocumentAnalyzer:
             self.logger.info(f"MEAT evidence cleanup: {cleaned_count} generic/duplicate/irrelevant entries removed.")
 
         return result
+
+    # ------------------------------------------------------------------
+    # Post-LLM: Strict evidence-only MEAT validation (NO fallback/inference)
+    # ------------------------------------------------------------------
+
+    # Minimum evidence length to be considered valid
+    _MIN_EVIDENCE_LENGTH = 3
+
+    def _strict_evidence_validation(self, result: dict, raw_text: str) -> dict:
+        """
+        Strict evidence validation layer: reject any MEAT entry where the
+        evidence text is absent, too short, or not verifiable in the source document.
+
+        Rules:
+          1. Evidence must be non-empty and >= _MIN_EVIDENCE_LENGTH chars.
+          2. Evidence must be found in the raw document text (substring or
+             high-word-overlap).
+          3. No inference, no fallback, no disease-name-only entries.
+          4. Diseases with zero valid MEAT components get status markers.
+          5. Confidence is downgraded when only a diagnosis is documented.
+
+        NO artificial enrichment is applied.
+        """
+        diseases = result.get("diseases", [])
+        rejected_count = 0
+        insufficient_count = 0
+
+        for d in diseases:
+            meat_val = d.get("meat_validation", {})
+            components_valid = {"M_monitor": False, "E_evaluate": False,
+                                "A_assess": False, "T_treat": False}
+
+            for key, label in [
+                ("M_monitor", "monitoring"),
+                ("E_evaluate", "evaluation"),
+                ("A_assess", "assessment"),
+                ("T_treat", "treatment"),
+            ]:
+                evidence = (meat_val.get(key) or "").strip()
+
+                # Rule 1: evidence must exist and be substantive
+                if not evidence or len(evidence) < self._MIN_EVIDENCE_LENGTH:
+                    if evidence:  # too short — reject silently
+                        rejected_count += 1
+                    meat_val[key] = ""
+                    continue
+
+                # Rule 2: evidence must be present in source document
+                if not self._evidence_in_document(evidence, raw_text):
+                    self.logger.debug(
+                        f"Rejected {label} evidence for '{d.get('disease_name', '')}': "
+                        f"not found in document."
+                    )
+                    meat_val[key] = ""
+                    rejected_count += 1
+                    continue
+
+                components_valid[key] = True
+
+            # Recalculate score from verified components only
+            valid_count = sum(components_valid.values())
+            meat_val["meat_score"] = valid_count
+
+            if valid_count == 0:
+                meat_val["meat_grade"] = "No MEAT"
+                meat_val["meat_status"] = "insufficient clinical evidence"
+                meat_val["no_monitoring"] = "No Monitoring evidence found"
+                meat_val["no_treatment"] = "No Treatment documented"
+                meat_val["no_evaluation"] = "No Evaluation evidence found"
+                meat_val["no_assessment"] = "Diagnosis documented without supporting MEAT criteria"
+                meat_val["evidence_based"] = False
+                d["meat_score"] = 0
+                d["meat_grade"] = "No MEAT"
+                # Downgrade confidence for diagnosis-only entries
+                current_conf = d.get("confidence_score", 0.8)
+                d["confidence_score"] = min(current_conf, 0.42)
+                insufficient_count += 1
+            elif valid_count == 1:
+                meat_val["meat_grade"] = "Weak evidence"
+                meat_val["meat_status"] = "single MEAT component documented"
+                meat_val["evidence_based"] = True
+                d["meat_score"] = 1
+                d["meat_grade"] = "Weak evidence"
+            elif valid_count == 2:
+                meat_val["meat_grade"] = "Moderate evidence"
+                meat_val["meat_status"] = "two MEAT components documented"
+                meat_val["evidence_based"] = True
+                d["meat_score"] = 2
+                d["meat_grade"] = "Moderate evidence"
+            else:  # 3 or 4
+                meat_val["meat_grade"] = "Strong evidence"
+                meat_val["meat_status"] = "strong MEAT documentation"
+                meat_val["evidence_based"] = True
+                d["meat_score"] = valid_count
+                d["meat_grade"] = "Strong evidence"
+
+            d["meat_validation"] = meat_val
+
+        if rejected_count:
+            self.logger.info(
+                f"Strict MEAT validation: {rejected_count} evidence entries rejected "
+                f"(absent or not found in document)."
+            )
+        if insufficient_count:
+            self.logger.info(
+                f"Strict MEAT validation: {insufficient_count} disease(s) marked as "
+                f"'insufficient clinical evidence' (no valid MEAT)."
+            )
+
+        return result
+
+    def _evidence_in_document(self, evidence: str, raw_text: str) -> bool:
+        """
+        Verify that an evidence string actually appears in the source document.
+        Uses three techniques:
+          1. Exact substring (case-insensitive, normalized whitespace)
+          2. Partial sentence overlap >= 30% word match
+          3. Key phrase from first 80 chars present
+        """
+        if not evidence or not raw_text:
+            return False
+
+        ev_norm = " ".join(evidence.lower().split())
+        doc_norm = " ".join(raw_text.lower().split())
+
+        # 1. Exact substring
+        if ev_norm in doc_norm:
+            return True
+
+        # 2. Word overlap on key part (first 80 chars of evidence)
+        key_part = ev_norm[:80]
+        ev_words = set(w for w in key_part.split() if len(w) > 3)
+        if not ev_words:
+            return False
+
+        # Search for any window in doc containing >= 30% of ev_words
+        words_found = sum(1 for w in ev_words if w in doc_norm)
+        if len(ev_words) > 0 and (words_found / len(ev_words)) >= 0.30:
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # REMOVED: Old fallback-based MEAT enrichment (_TREAT_SIGNALS,
+    # _MONITOR_SIGNALS, _EVALUATE_SIGNALS, _enrich_meat_from_context).
+    # Evidence must come directly from LLM extraction, verified against
+    # the source document. No artificial inference is allowed.
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Pre-LLM: NER-style candidate extraction (Approach 5)
@@ -1185,8 +1670,7 @@ class ClinicalDocumentAnalyzer:
 
             # Disease NOT found in document → hallucination
             self.logger.warning(
-                f"Two-step verification REJECTED: '{name}' not found in document "
-                f"(best fuzzy={best_ratio:.2f})"
+                f"Two-step verification REJECTED: '{name}' not found in document"
             )
             newly_excluded.append({
                 "term": name,
@@ -1194,7 +1678,6 @@ class ClinicalDocumentAnalyzer:
                 "source_section": disease.get("source_section", "unknown"),
                 "exclusion_reasoning": (
                     f"Disease name not found in document text. "
-                    f"Best fuzzy match ratio: {best_ratio:.2f}. "
                     f"Removed by two-step verification."
                 ),
             })
@@ -1438,29 +1921,34 @@ class ClinicalDocumentAnalyzer:
             meat_grade = d.get("meat_grade", meat_val.get("meat_grade", ""))
             meat_score = d.get("meat_score", meat_val.get("meat_score", 0))
 
-            # Map meat_grade to tier
-            tier_map = {
-                "Full MEAT": "full_meat",
-                "Medium MEAT": "medium_meat",
-                "Half MEAT": "half_meat",
-                "Partial MEAT": "half_meat",
-                "No MEAT": "invalid",
-                # Also handle code-style names as fallback
-                "FULL_MEAT": "full_meat",
-                "HIGH_MEAT": "medium_meat",
-                "PARTIAL_MEAT": "half_meat",
-                "LOW_MEAT": "half_meat",
-                "NO_MEAT": "invalid",
-            }
-            tier = tier_map.get(meat_grade, "half_meat")
+            # Evidence-based MEAT tier: only count components with real
+            # documented evidence from the source PDF.
+            _m = bool(meat_val.get("M_monitor"))
+            _e = bool(meat_val.get("E_evaluate"))
+            _a = bool(meat_val.get("A_assess"))
+            _t = bool(meat_val.get("T_treat"))
+            _components = sum([_m, _e, _a, _t])
+
+            # New evidence-based scoring: 0=no_meat, 1=weak, 2=moderate, 3+=strong
+            if _components >= 3:
+                tier = "strong_evidence"
+            elif _components == 2:
+                tier = "moderate_evidence"
+            elif _components == 1:
+                tier = "weak_evidence"
+            else:
+                tier = "no_meat"
 
             tier_label = {
-                "full_meat": "Full MEAT",
-                "medium_meat": "Medium MEAT",
-                "half_meat": "Half MEAT",
-                "history_only": "History Only",
-                "invalid": "Invalid",
-            }.get(tier, "Unknown")
+                "strong_evidence": "Strong Evidence",
+                "moderate_evidence": "Moderate Evidence",
+                "weak_evidence": "Weak Evidence",
+                "no_meat": "No MEAT",
+            }.get(tier, "No MEAT")
+
+            # Evidence-based flags from strict validation
+            meat_status = d.get("meat_status", meat_val.get("meat_status", ""))
+            evidence_based = d.get("evidence_based", meat_val.get("evidence_based", _components > 0))
 
             source_section = d.get("source_section", "unknown")
             all_sections = d.get("all_sections_mentioned", [source_section])
@@ -1513,11 +2001,14 @@ class ClinicalDocumentAnalyzer:
             ass = bool(meat_val.get("A_assess"))
             tre = bool(meat_val.get("T_treat"))
 
-            # Compute confidence from MEAT score (0-4) and ICD confidence
+            # Evidence-based confidence: no MEAT → cap at 0.42
             meat_components = sum([mon, eva, ass, tre])
-            confidence = round(
-                (meat_components / 4) * 0.6 + icd_confidence * 0.4, 2
-            )
+            if meat_components == 0:
+                confidence = round(min(0.42, icd_confidence * 0.4), 2)
+            else:
+                confidence = round(
+                    (meat_components / 4) * 0.6 + icd_confidence * 0.4, 2
+                )
 
             unified.append({
                 "number": idx,
@@ -1533,6 +2024,9 @@ class ClinicalDocumentAnalyzer:
                 "treatment": tre,
                 "meat_level": tier_label,
                 "meat_tier": tier,
+                "meat_score": _components,
+                "meat_status": meat_status,
+                "evidence_based": evidence_based,
                 "confidence": confidence,
                 "icd_confidence": icd_confidence,
                 "icd_method": "single_pass_llm",
@@ -1617,55 +2111,31 @@ class ClinicalDocumentAnalyzer:
         doc_text = text[:25000] if len(text) > 25000 else text
 
         config = self._load_prompt_config()
-        user_prompt = config.get("user_prompt", {})
 
-        if not user_prompt:
-            self.logger.warning("Using fallback inline prompt (prompt.json unavailable)")
-            return (
-                "You are a senior clinical coding specialist. Extract every clinically "
-                "active, billable disease from the clinical document below. For each "
-                "disease: validate MEAT (Monitor, Evaluate, Assess, Treat) with verbatim "
-                "evidence, assign the most specific ICD-10-CM code, and log excluded "
-                "conditions.\n\n"
-                f"CLINICAL DOCUMENT:\n\"\"\"\n{doc_text}\n\"\"\"\n\n"
-                "Return ONLY valid JSON with keys: sections_found, summary, diseases "
-                "(each with disease_name, active_status, meat_grade, meat_score, "
-                "source_section, all_sections_mentioned, context_snippets, "
-                "meat_validation with M_monitor/E_evaluate/A_assess/T_treat, "
-                "icd10_code, icd10_description, icd10_selection_reasoning, hcc_status), "
-                "excluded_conditions."
+        # ── Detect prompt.json structure ──────────────────────────────────────
+        # New structure: top-level STEP_x keys (e.g. STEP_0_dynamic_document_reading)
+        # Old structure: nested under `user_prompt` with phase_x keys
+        # We support BOTH formats.
+        step_keys = [k for k in config if k.startswith("STEP_")]
+        user_prompt = config.get("user_prompt", {})
+        has_new_structure = len(step_keys) > 0
+
+        if not has_new_structure and not user_prompt:
+            self.logger.warning("prompt.json has no recognized structure — using inline fallback")
+
+        # ── Build NER hint string ─────────────────────────────────────────────
+        ner_hint = ""
+        if ner_candidates:
+            ner_hint = (
+                "The following disease candidates were pre-extracted via NER. "
+                "Use as a REFERENCE — extract these AND any others in the document, "
+                "but NEVER hallucinate conditions not in the text.\n"
+                "Candidates:\n"
+                + "\n".join(f"  - {c}" for c in ner_candidates[:40])
             )
 
-        # Build readable prompt from structured phases
-        parts = []
-
-        # Core philosophy as opening instruction
-        if "core_philosophy" in user_prompt:
-            parts.append(f"CORE PHILOSOPHY:\n{user_prompt['core_philosophy']}")
-
-        # Anti-hallucination rules (Approach 1, 2, 3)
-        anti_hall = user_prompt.get("ANTI_HALLUCINATION_RULES")
-        if anti_hall:
-            # Inject NER candidates if available
-            ner_hint = ""
-            if ner_candidates:
-                ner_hint = (
-                    "The following disease candidates were pre-extracted from the "
-                    "document using clinical NER. Use this list as a REFERENCE — "
-                    "you may extract diseases from this list AND any additional "
-                    "diseases you find through clinical reasoning, but you MUST NOT "
-                    "extract diseases that do not appear anywhere in the document text.\n"
-                    "Pre-extracted candidates:\n"
-                    + "\n".join(f"  - {c}" for c in ner_candidates[:40])
-                )
-            parts.append(f"\nANTI-HALLUCINATION RULES:")
-            # Replace the NER_CANDIDATE_HINT placeholder
-            anti_hall_text = self._flatten_to_text(anti_hall)
-            anti_hall_text = anti_hall_text.replace("{{NER_CANDIDATES}}", ner_hint)
-            parts.append(anti_hall_text)
-
-        # Clinical document in a clearly delimited block — UP FRONT
-        parts.append(
+        # ── Clinical document block (always included) ─────────────────────────
+        doc_block = (
             f"\n{'='*60}\n"
             f"CLINICAL DOCUMENT TO ANALYZE:\n"
             f"{'='*60}\n"
@@ -1675,35 +2145,118 @@ class ClinicalDocumentAnalyzer:
             f"{'='*60}"
         )
 
-        # Phases — convert each from JSON structure to readable text
-        phase_keys = [
-            ("phase_1_section_mapping", "PHASE 1 — SECTION MAPPING"),
-            ("phase_2_disease_detection", "PHASE 2 — DISEASE DETECTION"),
-            ("phase_3_meat_validation", "PHASE 3 — MEAT VALIDATION"),
-            ("phase_4_icd10_coding", "PHASE 4 — ICD-10 CODING"),
-            ("phase_5_exclusion_logging", "PHASE 5 — EXCLUSION LOGGING"),
-            ("phase_6_self_verification", "PHASE 6 — SELF-VERIFICATION"),
-            ("phase_7_output_format", "PHASE 7 — OUTPUT FORMAT"),
-        ]
-        if dietary_analysis:
-            phase_keys.append(
-                ("phase_8_dietary_and_meat_based_analysis", "PHASE 8 — DIETARY & MEAT-BASED ANALYSIS")
-            )
+        # ── Build prompt from NEW structure (STEP_x keys) ─────────────────────
+        if has_new_structure:
+            parts = []
 
-        for key, label in phase_keys:
-            phase = user_prompt.get(key)
-            if not phase:
-                continue
-            parts.append(f"\n{label}:")
-            parts.append(self._flatten_to_text(phase))
+            # System philosophy header
+            core = config.get("core_philosophy")
+            if core:
+                parts.append(f"CORE PHILOSOPHY:\n{self._flatten_to_text(core)}")
 
-        # Final instruction
-        if "final_instruction" in user_prompt:
-            parts.append(f"\n{user_prompt['final_instruction']}")
+            if ner_hint:
+                parts.append(f"NER PRE-EXTRACTION HINT:\n{ner_hint}")
 
-        prompt = "\n\n".join(parts)
-        self.logger.info(f"Built prompt: {len(prompt)} chars with {len(doc_text)} char document")
-        return prompt
+            # Document block
+            parts.append(doc_block)
+
+            # All STEP instructions in order
+            ordered_steps = [
+                ("STEP_0_dynamic_document_reading",  "STEP 0 — DYNAMIC DOCUMENT READING"),
+                ("STEP_1_section_mapping",            "STEP 1 — SECTION MAPPING & TIERS"),
+                ("STEP_2_disease_extraction",         "STEP 2 — DISEASE EXTRACTION"),
+                ("STEP_3_zcode_extraction_with_encounter_gate", "STEP 3 — Z-CODE EXTRACTION GATE"),
+                ("STEP_4_meat_validation",            "STEP 4 — MEAT VALIDATION"),
+                ("STEP_4A_mdm_activation_override",   "STEP 4A — MDM ACTIVATION OVERRIDE"),
+                ("STEP_5_icd10_coding",               "STEP 5 — ICD-10 CODING"),
+                ("STEP_6_exclusion_logging",          "STEP 6 — EXCLUSION LOGGING"),
+                ("STEP_7_self_verification",          "STEP 7 — SELF-VERIFICATION CHECKLIST"),
+                ("STEP_8_output_format",              "STEP 8 — OUTPUT FORMAT"),
+            ]
+
+            for key, label in ordered_steps:
+                step = config.get(key)
+                if not step:
+                    continue
+                parts.append(f"\n{label}:\n{self._flatten_to_text(step)}")
+
+            # Usage instructions (final instruction)
+            usage = config.get("usage_instructions", {}).get("how_to_use_this_prompt", "")
+            if usage:
+                parts.append(f"\nFINAL INSTRUCTION:\n{usage}")
+
+            prompt = "\n\n".join(parts)
+            self.logger.info(f"[prompt.json STEP_x] Built prompt: {len(prompt)} chars")
+            return prompt
+
+        # ── Build prompt from OLD structure (user_prompt.phase_x keys) ────────
+        if user_prompt:
+            parts = []
+            if "core_philosophy" in user_prompt:
+                parts.append(f"CORE PHILOSOPHY:\n{user_prompt['core_philosophy']}")
+            anti_hall = user_prompt.get("ANTI_HALLUCINATION_RULES")
+            if anti_hall:
+                parts.append("\nANTI-HALLUCINATION RULES:")
+                anti_hall_text = self._flatten_to_text(anti_hall)
+                anti_hall_text = anti_hall_text.replace("{{NER_CANDIDATES}}", ner_hint)
+                parts.append(anti_hall_text)
+            parts.append(doc_block)
+            phase_keys = [
+                ("phase_1_section_mapping",  "PHASE 1 — SECTION MAPPING"),
+                ("phase_2_disease_detection", "PHASE 2 — DISEASE DETECTION"),
+                ("phase_3_meat_validation",  "PHASE 3 — MEAT VALIDATION"),
+                ("phase_4_icd10_coding",     "PHASE 4 — ICD-10 CODING"),
+                ("phase_5_exclusion_logging", "PHASE 5 — EXCLUSION LOGGING"),
+                ("phase_6_self_verification", "PHASE 6 — SELF-VERIFICATION"),
+                ("phase_7_output_format",    "PHASE 7 — OUTPUT FORMAT"),
+            ]
+            if dietary_analysis:
+                phase_keys.append(("phase_8_dietary_and_meat_based_analysis", "PHASE 8 — DIETARY"))
+            for key, label in phase_keys:
+                phase = user_prompt.get(key)
+                if not phase:
+                    continue
+                parts.append(f"\n{label}:\n{self._flatten_to_text(phase)}")
+            if "final_instruction" in user_prompt:
+                parts.append(f"\n{user_prompt['final_instruction']}")
+            prompt = "\n\n".join(parts)
+            self.logger.info(f"[prompt.json phase_x] Built prompt: {len(prompt)} chars")
+            return prompt
+
+        # ── Last-resort inline fallback (kept minimal — triggers alert) ───────
+        self.logger.error(
+            "CRITICAL: prompt.json not loaded AND no structure found. "
+            "Using minimal inline fallback. FIX prompt.json immediately."
+        )
+        return (
+            "You are a senior clinical coding specialist. Extract every clinically "
+            "active, billable disease from the clinical document below. For each "
+            "disease: validate MEAT (Monitor, Evaluate, Assess, Treat) with verbatim "
+            "evidence, assign the most specific ICD-10-CM code, and log excluded "
+            "conditions.\n\n"
+            "CRITICAL RULES:\n"
+            "1. SLASH SPLIT: If Assessment has 'Condition A/Condition B', extract EACH "
+            "as a SEPARATE disease entry with its own ICD code. "
+            "Example: 'Atrial fibrillation/flutter' → entry 1: I48.91 (Afib), "
+            "entry 2: I48.92 (Flutter). NEVER group slash-separated diagnoses.\n"
+            "2. DEVICE STATUS Z-CODES: If a device (e.g. Foley catheter, tracheostomy, "
+            "pacemaker, ostomy) is in the Assessment, extract a status Z-code: "
+            "Foley/urethral catheter → Z97.8, Tracheostomy → Z93.0, "
+            "Gastrostomy → Z93.1, Colostomy → Z93.3, Ileostomy → Z93.2.\n"
+            "3. FAMILY HISTORY Z-CODES: Extract Z80.x/Z82.x/Z83.x when driving clinical decisions.\n"
+            "4. BMI CODES: Extract Z68.x alongside E66.x (Overweight/Obesity).\n"
+            "5. SURVEILLANCE: Active Problem List items with a future follow-up plan are ACTIVE.\n"
+            "6. MDM RULE: Condition mentioned in Assessment = ACTIVE, even if treatment declined.\n"
+            "7. THROMBOCYTOSIS: Prefer D75.839 (Thrombocytosis, other) over generic D75.x.\n"
+            "8. INCONTINENCE + FOLEY: Code BOTH R32 (incontinence) AND Z97.8 (Foley status) "
+            "when both are in Assessment. They are separate codeable conditions.\n\n"
+            f"{doc_block}\n\n"
+            "Return ONLY valid JSON: sections_found, summary, diseases (disease_name, "
+            "active_status, meat_grade, meat_score, source_section, all_sections_mentioned, "
+            "context_snippets, meat_validation[M_monitor,E_evaluate,A_assess,T_treat], "
+            "icd10_code, icd10_description, icd10_selection_reasoning, hcc_status), "
+            "excluded_conditions."
+        )
 
     # ------------------------------------------------------------------
     # Helpers

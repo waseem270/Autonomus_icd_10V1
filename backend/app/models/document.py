@@ -1,5 +1,5 @@
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import String, Text, Boolean, Enum as SQLEnum, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .base import Base, TimestampMixin
@@ -10,7 +10,9 @@ class Document(Base, TimestampMixin):
 
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=True)
-    upload_date: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    upload_date: Mapped[datetime] = mapped_column(
+        default=lambda: datetime.now(timezone.utc)
+    )
     patient_id: Mapped[Optional[str]] = mapped_column(String(50))
     raw_text: Mapped[Optional[str]] = mapped_column(Text)
     page_count: Mapped[Optional[int]] = mapped_column(default=0)

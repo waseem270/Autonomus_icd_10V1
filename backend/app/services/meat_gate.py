@@ -65,7 +65,8 @@ class MEATValidationGate:
                 validation["issues_found"].append("Lacks Clinical Management (M/E/T): No evidence of active management.")
 
         # 2. Hallucination Check: Verify evidence quotes exist in original context
-        #    Uses FUZZY matching to handle minor whitespace/formatting differences
+        #    Uses FUZZY matching to handle minor whitespace/formatting differences.
+        #    ALSO: reject MEAT elements that have no evidence text at all.
         all_context_text = _normalize_ws(self._get_all_context_text(context))
         
         for element in ["monitoring", "evaluation", "assessment", "treatment"]:
@@ -75,9 +76,13 @@ class MEATValidationGate:
             evidence_key = f"{element}_evidence"
             evidence = meat_result.get(evidence_key, "").strip()
             
-            if not evidence:
-                validation["issues_found"].append(f"{element.upper()}: Empty evidence quote provided.")
+            # Strict: evidence text is REQUIRED for every claimed MEAT element
+            if not evidence or len(evidence) < 5:
+                validation["issues_found"].append(
+                    f"{element.upper()}: No evidence text provided — element rejected."
+                )
                 validation["final_meat"][element] = False
+                validation["final_meat"][f"{element}_confidence"] = 0.0
                 continue
 
             evidence_norm = _normalize_ws(evidence)
@@ -214,12 +219,19 @@ class MEATValidationGate:
 
         # 7. Audit Compliance Check
         if settings.MEAT_REQUIRE_EVIDENCE and validation["meat_valid"]:
+            has_any_verifiable_evidence = False
             for element in ["monitoring", "evaluation", "assessment", "treatment"]:
                 if validation["final_meat"].get(element, False):
                     ev = validation["final_meat"].get(f"{element}_evidence", "")
                     if len(ev.strip()) < 8:
                         validation["issues_found"].append(f"{element.upper()}: Insufficient evidence for audit compliance.")
                         validation["requires_manual_review"] = True
+                    else:
+                        has_any_verifiable_evidence = True
+            # If no element has verifiable evidence, MEAT is invalid
+            if not has_any_verifiable_evidence:
+                validation["meat_valid"] = False
+                validation["issues_found"].append("No MEAT element has verifiable evidence text — overall MEAT rejected.")
 
         self.logger.info(
             f"MEAT Gate [{disease_name}]: Valid={validation['meat_valid']}, "

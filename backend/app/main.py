@@ -9,22 +9,33 @@ from .api.routes import documents
 import logging
 import sys
 
-# Configure logging (UTF-8 to handle Unicode in clinical text on Windows)
-_log_fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from pythonjsonlogger import jsonlogger
+
+# Configure structured JSON logging for production and plain-text for dev
+_LOG_LEVEL = getattr(logging, getattr(settings, "LOG_LEVEL", "INFO"), logging.INFO)
+_use_json = getattr(settings, "LOG_FORMAT_JSON", True)
+
+if _use_json:
+    _fmt = jsonlogger.JsonFormatter(
+        "%(asctime)s %(name)s %(levelname)s %(message)s",
+        rename_fields={"asctime": "timestamp", "levelname": "level"},
+    )
+else:
+    _fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
 _stream_handler = logging.StreamHandler(
     stream=open(sys.stdout.fileno(), mode='w', encoding='utf-8', closefd=False)
 )
-_stream_handler.setFormatter(logging.Formatter(_log_fmt))
+_stream_handler.setFormatter(_fmt)
 
 # Ensure log directory exists before file handler is created
 log_path = Path(settings.LOG_FILE)
 log_path.parent.mkdir(parents=True, exist_ok=True)
 
 _file_handler = logging.FileHandler(settings.LOG_FILE, encoding='utf-8')
-_file_handler.setFormatter(logging.Formatter(_log_fmt))
+_file_handler.setFormatter(_fmt)
 logging.basicConfig(
-    level=logging.INFO,
-    format=_log_fmt,
+    level=_LOG_LEVEL,
     handlers=[_stream_handler, _file_handler]
 )
 logger = logging.getLogger(__name__)
@@ -36,28 +47,28 @@ async def lifespan(app: FastAPI):
     Startup/shutdown events.
     """
     # Startup
-    print("🚀 Starting Medical ICD Mapper API...")
+    print("Starting Medical ICD Mapper API...")
     
     # 1. Create database tables
     try:
         create_tables()
-        print("✅ Database tables created/verified")
+        print("[SUCCESS] Database tables created/verified")
     except Exception as e:
-        print(f"❌ Error creating database tables: {e}")
+        print(f"[ERROR] Error creating database tables: {e}")
 
     # 2. Create required folders
     required_folders = [settings.UPLOAD_FOLDER, "logs"]
     for folder in required_folders:
         Path(folder).mkdir(exist_ok=True)
-    print("✅ System folders ready")
+    print("[SUCCESS] System folders ready")
     
-    print(f"📚 Database URL: {settings.DATABASE_URL}")
-    print(f"📂 Uploads directory: {settings.UPLOAD_FOLDER}")
+    print(f"Database URL: {settings.DATABASE_URL}")
+    print(f"Uploads directory: {settings.UPLOAD_FOLDER}")
     
     yield
     
     # Shutdown
-    print("👋 Shutting down Medical ICD Mapper API...")
+    print("Shutting down Medical ICD Mapper API...")
 
 # Create FastAPI app
 app = FastAPI(

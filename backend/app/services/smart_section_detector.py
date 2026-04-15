@@ -789,7 +789,8 @@ class SmartSectionDetector:
     def __init__(self) -> None:
         self.logger = logging.getLogger(__name__)
         self._client = None
-        self.model_name = settings.GEMINI_MODEL
+        from ..core.config import get_active_model
+        self.model_name = get_active_model()
         self._content_inferrer = _content_inferrer
 
         # Config for section detection (needs structured JSON output)
@@ -817,8 +818,13 @@ class SmartSectionDetector:
     @property
     def client(self):
         if self._client is None:
-            from ..core.config import create_genai_client
-            self._client = create_genai_client()
+            from ..core.config import get_llm_provider, create_genai_client, create_openai_client
+            provider = get_llm_provider()
+            if provider == "openai":
+                oai = create_openai_client()
+                self._client = oai if oai else "__openai_sentinel__"
+            else:
+                self._client = create_genai_client()
         return self._client
 
     # ==================================================================
@@ -991,13 +997,26 @@ class SmartSectionDetector:
         result = self._extract_json(raw)
 
         # Task 1: Sections
-        llm_sections = result.get("sections", [])
+        llm_sections_raw = result.get("sections", [])
         rejected = result.get("rejected_subsections", [])
         confidence = float(result.get("confidence", 0.85))
-        
+
         # Task 2: Validated Diseases (Stored for enrichment)
         validated_diseases = result.get("diseases", [])
         self.logger.info(f"LLM identified {len(validated_diseases)} validated diseases")
+
+        # Normalize: OpenAI may return sections as a dict {header: canonical}
+        # instead of a list of objects. Convert to list format.
+        if isinstance(llm_sections_raw, dict):
+            # Convert {"Assessment and Plan": "assessment_and_plan", ...} to list
+            llm_sections = [
+                {"header_text": hdr, "normalized_name": canonical}
+                for hdr, canonical in llm_sections_raw.items()
+            ]
+        elif isinstance(llm_sections_raw, list):
+            llm_sections = llm_sections_raw
+        else:
+            llm_sections = []
 
         if not llm_sections:
             return {
@@ -1012,7 +1031,12 @@ class SmartSectionDetector:
         # as section headers (e.g. "Diagnosis Date" inside PMH tables).
         filtered_sections = []
         for s in llm_sections:
-            hdr = (s.get("header_text") or "").strip()
+            # s can be dict or (rarely) a plain string — handle both
+            if isinstance(s, str):
+                hdr = s.strip()
+                s = {"header_text": hdr, "normalized_name": "other"}
+            else:
+                hdr = (s.get("header_text") or s.get("header") or "").strip()
             hdr_clean = hdr.lower().strip("[]").rstrip(":").strip()
             if hdr_clean in self._NOT_SECTION_LABELS:
                 self.logger.info(

@@ -32,6 +32,8 @@ MEDICAL_ABBREVIATIONS = {
     "SLE": "Systemic Lupus Erythematosus",
     "IBS": "Irritable Bowel Syndrome",
     "IBD": "Inflammatory Bowel Disease",
+    "PCOS": "Polycystic Ovarian Syndrome",
+    "UC": "Ulcerative Colitis",
     "AFib": "Atrial Fibrillation",
     "SVT": "Supraventricular Tachycardia",
     "MS": "Multiple Sclerosis",

@@ -9,428 +9,446 @@ BACKEND_BASE_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 API_URL = f"{BACKEND_BASE_URL}/api/v1"
 
 st.set_page_config(
-    page_title="Autonomous ICD-10 Coding Tool",
-    page_icon="🏥",
-    layout="wide"
+    page_title="ICD-10 Medical Coder",
+    page_icon="⚕️",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ── Session State Initialisation ────────────────────────────────────────────
-for key, default in {
-    "document_id": None,
-    "extract_data": None,
-    "structure_data": None,
-    "unified_data": None,
-    "filename": None,
-}.items():
+# ── Dark Theme CSS ─────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    /* Dark background */
+    .stApp { background-color: #0e1117; }
+    header[data-testid="stHeader"] { background-color: #0e1117; }
+
+    /* Card-style containers */
+    div[data-testid="stMetric"] {
+        background: #1a1d24;
+        border: 1px solid #2d333b;
+        border-radius: 8px;
+        padding: 12px 16px;
+    }
+    div[data-testid="stMetric"] label { color: #8b949e !important; font-size: 0.8rem; }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #e6edf3 !important; }
+
+    /* Expander */
+    details { background: #161b22 !important; border: 1px solid #21262d !important; border-radius: 8px !important; }
+    details summary { color: #e6edf3 !important; }
+
+    /* Buttons */
+    .stButton > button[kind="primary"] {
+        background: #238636 !important; color: #fff !important;
+        border: none; border-radius: 6px; font-weight: 600;
+    }
+    .stButton > button[kind="primary"]:hover { background: #2ea043 !important; }
+
+    /* Download buttons */
+    .stDownloadButton > button {
+        background: #21262d !important; color: #c9d1d9 !important;
+        border: 1px solid #30363d !important; border-radius: 6px;
+    }
+    .stDownloadButton > button:hover { border-color: #58a6ff !important; }
+
+    /* Progress bar */
+    .stProgress > div > div > div { background-color: #238636 !important; }
+
+    /* Dataframe */
+    .stDataFrame { border: 1px solid #21262d; border-radius: 8px; }
+
+    /* File uploader */
+    [data-testid="stFileUploader"] {
+        background: #161b22; border: 2px dashed #30363d; border-radius: 8px; padding: 20px;
+    }
+
+    /* Divider */
+    hr { border-color: #21262d !important; }
+
+    /* Status indicator */
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+    .status-online { background: #238636; }
+    .status-offline { background: #da3633; }
+
+    /* Hide Streamlit branding */
+    #MainMenu, footer { visibility: hidden; }
+
+    /* Pipeline step progress */
+    .pipeline-step {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 4px 12px; border-radius: 16px; font-size: 0.8rem;
+        color: #8b949e; background: #161b22; border: 1px solid #21262d;
+    }
+    .pipeline-step.active { color: #58a6ff; border-color: #58a6ff; }
+    .pipeline-step.done { color: #3fb950; border-color: #3fb950; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Session State ──────────────────────────────────────────────────────────
+for key in ("document_id", "extract_data", "structure_data", "unified_data", "filename", "pipeline_error"):
     if key not in st.session_state:
-        st.session_state[key] = default
+        st.session_state[key] = None
 
-# ── Sidebar ─────────────────────────────────────────────────────────────────
+# ── Backend Status ─────────────────────────────────────────────────────────
+backend_ok = False
+health_data = {}
+try:
+    _h = requests.get(f"{BACKEND_BASE_URL}/health", timeout=2)
+    backend_ok = _h.status_code == 200
+    if backend_ok:
+        health_data = _h.json()
+except Exception:
+    pass
+
+# ── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("📊 System Status")
-    try:
-        r = requests.get(f"{BACKEND_BASE_URL}/health", timeout=2)
-        if r.status_code == 200:
-            hd = r.json()
-            st.success("✅ Backend Connected")
-            st.caption(f"Status: {hd.get('status')} | Version: {hd.get('version')}")
-        else:
-            st.error("❌ Backend Error")
-    except Exception:
-        st.error("❌ Backend Offline")
-
+    st.markdown("## ⚕️ ICD-10 Coder")
     st.markdown("---")
-    st.markdown("**3-Step Pipeline**")
-    st.caption("Step 1 → Upload & Extract")
-    st.caption("Step 2 → Structure & Analyze")
-    st.caption("Step 3 → MEAT + ICD-10 Codes")
-    st.caption("Supported: PDF | Max: 25MB")
 
-    st.markdown("---")
-    st.markdown("**🛠 Debugging logs:**")
-    if Path("backend_logs.txt").exists():
-        with st.expander("View Backend Logs", expanded=False):
-            st.code(Path("backend_logs.txt").read_text()[-1500:], language="bash")
+    # System status
+    st.markdown("**System Status**")
+    if backend_ok:
+        st.success(f"Backend Online  v{health_data.get('version', '1.0')}")
     else:
-        st.caption("No backend logs found.")
+        st.error("Backend Offline")
+        st.caption(f"Expected at: {BACKEND_BASE_URL}")
 
-# ── Title ───────────────────────────────────────────────────────────────────
-st.title("🏥 Autonomous ICD-10 Coding Tool")
-st.markdown("Upload a clinical PDF → Extract text → Detect sections & diseases → Validate MEAT & map ICD-10 codes")
+    st.markdown("---")
+
+    # Pipeline info
+    st.markdown("**Pipeline**")
+    st.markdown("""
+- 📤 Upload PDF  
+- 🔍 Extract text (OCR)  
+- 📑 Detect sections  
+- 🧬 MEAT validation  
+- 🏷️ ICD-10 mapping  
+""")
+    st.caption("Max file size: 25 MB")
+
+    st.markdown("---")
+
+    # Session info
+    if st.session_state.unified_data:
+        ud = st.session_state.unified_data
+        sm = ud.get("summary", {})
+        st.markdown("**Current Document**")
+        if st.session_state.filename:
+            st.caption(f"📎 {st.session_state.filename}")
+        st.metric("Active Codes", ud.get("total_diseases", 0))
+        st.metric("ICD-10 Mapped", sm.get("icd_mapped", 0))
+        st.metric("Processing Time", f"{ud.get('processing_time', 0):.1f}s")
+
+        st.markdown("---")
+        st.markdown("**MEAT Tiers**")
+        tier_data = {
+            "🟢 Strong":   sm.get("strong_evidence", 0),
+            "🟡 Moderate": sm.get("moderate_evidence", 0),
+            "🟠 Weak":     sm.get("weak_evidence", 0),
+            "🔴 None":     sm.get("no_meat", 0),
+        }
+        for label, count in tier_data.items():
+            st.caption(f"{label}: **{count}**")
+
+        st.markdown("---")
+        if st.button("🔄 Analyze Another Document", use_container_width=True):
+            for k in ("document_id", "extract_data", "structure_data", "unified_data", "filename", "pipeline_error"):
+                st.session_state[k] = None
+            st.rerun()
+    else:
+        st.markdown("**How it works**")
+        st.markdown("""
+1. Drop a clinical PDF  
+2. Press **Analyze Document**  
+3. Pipeline runs automatically  
+4. Download billing/full CSV  
+""")
+        st.markdown("---")
+        st.caption("LLM: GPT-5.4")
+        st.caption("Evidence: MEAT criteria")
+        st.caption("Codes: ICD-10-CM")
+
+# ── Header ─────────────────────────────────────────────────────────────────
+st.markdown("## ⚕️ ICD-10 Medical Coder")
+st.caption("Upload a clinical PDF — automated extraction, MEAT validation & ICD-10 mapping")
+st.markdown("---")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STEP 1: Upload & Extract
+# Upload & Automated Pipeline
 # ═══════════════════════════════════════════════════════════════════════════
-st.header("📄 Step 1: Upload & Extract Text")
-
 uploaded_file = st.file_uploader(
-    "Choose a PDF file",
+    "Drop a clinical PDF here",
     type=["pdf"],
-    help="Upload a medical document in PDF format"
+    label_visibility="collapsed",
+    help="Supported: PDF up to 25 MB",
 )
+
+if uploaded_file and not st.session_state.unified_data:
+    st.caption(f"📎 **{uploaded_file.name}** — {uploaded_file.size / 1_048_576:.2f} MB")
 
 if uploaded_file:
-    col1, col2 = st.columns(2)
-    col1.info(f"**Filename:** {uploaded_file.name}")
-    col2.info(f"**Size:** {uploaded_file.size / 1_048_576:.2f} MB")
-
-    if st.button("🚀 Upload & Extract Text", type="primary"):
-        # Reset downstream state
-        st.session_state.document_id = None
-        st.session_state.extract_data = None
-        st.session_state.structure_data = None
-        st.session_state.unified_data = None
+    if st.button("⚡ Analyze Document", type="primary", use_container_width=True):
+        # Reset all state
+        for key in ("document_id", "extract_data", "structure_data", "unified_data", "pipeline_error"):
+            st.session_state[key] = None
         st.session_state.filename = uploaded_file.name
 
-        with st.spinner("Uploading document…"):
-            try:
-                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
-                up_resp = requests.post(f"{API_URL}/documents/upload", files=files, timeout=60)
+        progress = st.progress(0, text="Uploading document…")
+        error_occurred = False
 
-                if up_resp.status_code == 200:
-                    up_data = up_resp.json()
-                    doc_id = up_data["document_id"]
-                    st.session_state.document_id = doc_id
-                    st.success("✅ Uploaded successfully!")
-                    st.caption(f"Document ID: {doc_id}")
+        try:
+            # Step 1: Upload
+            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+            up_resp = requests.post(f"{API_URL}/documents/upload", files=files, timeout=60)
+            if up_resp.status_code != 200:
+                st.error(f"Upload failed: {up_resp.text}")
+                error_occurred = True
 
-                    with st.spinner("Extracting text (OCR if needed)…"):
-                        ex_resp = requests.post(f"{API_URL}/documents/{doc_id}/extract", timeout=180)
-                        if ex_resp.status_code == 200:
-                            st.session_state.extract_data = ex_resp.json()
-                            st.success("✅ Text extracted!")
-                        else:
-                            st.error(f"❌ Extraction failed: {ex_resp.text}")
-                else:
-                    st.error(f"❌ Upload failed: {up_resp.text}")
-            except Exception as e:
-                st.error(f"❌ Connection Error: {e}")
-                st.info(f"Ensure FastAPI backend is running on {BACKEND_BASE_URL}")
+            if not error_occurred:
+                doc_id = up_resp.json()["document_id"]
+                st.session_state.document_id = doc_id
+                progress.progress(15, text="Extracting text…")
 
-# ── Extraction Results ───────────────────────────────────────────────────
-if st.session_state.extract_data:
-    ed = st.session_state.extract_data
+                # Step 2: Extract
+                ex_resp = requests.post(f"{API_URL}/documents/{doc_id}/extract", timeout=180)
+                if ex_resp.status_code != 200:
+                    st.error(f"Text extraction failed: {ex_resp.text}")
+                    error_occurred = True
 
-    st.divider()
-    st.subheader("🏁 Extraction Results")
+            if not error_occurred:
+                st.session_state.extract_data = ex_resp.json()
+                progress.progress(30, text="Analyzing document structure…")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Pages", ed["page_count"])
-    m2.metric("Method", ed["extraction_method"].upper())
-    m3.metric("Confidence", f"{ed['confidence_score']:.1%}")
-    m4.metric("Quality", f"{ed['quality_score']:.1%}")
+                # Step 3: Structure
+                st_resp = requests.post(f"{API_URL}/documents/{doc_id}/structure", timeout=300)
+                if st_resp.status_code == 503:
+                    st.warning("LLM API temporarily unavailable. Please retry in a moment.")
+                    error_occurred = True
+                elif st_resp.status_code != 200:
+                    st.error(f"Structure analysis failed: {st_resp.text}")
+                    error_occurred = True
 
-    if "processing_time" in ed:
-        st.caption(f"Processing time: {ed['processing_time']:.2f}s")
+            if not error_occurred:
+                st.session_state.structure_data = st_resp.json()
+                progress.progress(50, text="Running MEAT validation & ICD-10 mapping…")
 
-    with st.expander("📝 View Extracted Text"):
-        st.text_area("Raw Text", ed["raw_text"], height=200, disabled=False)
-
-    st.download_button(
-        "⬇️ Download Extracted Text",
-        data=ed["raw_text"],
-        file_name=f"{Path(st.session_state.filename or 'doc').stem}_extracted.txt",
-        mime="text/plain"
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 2: Structure & Analyze (Sections + Diseases)
-# ═══════════════════════════════════════════════════════════════════════════
-if st.session_state.extract_data and st.session_state.document_id:
-    st.markdown("---")
-    st.header("📑 Step 2: Structure & Analyze")
-    st.info("Detect clinical sections and their content, then extract all diseases from the document.")
-
-    if st.button("🔍 Detect Sections & Diseases", type="primary"):
-        # Reset step 3 data
-        st.session_state.structure_data = None
-        st.session_state.unified_data = None
-
-        doc_id = st.session_state.document_id
-        with st.spinner("Analyzing document structure and detecting diseases… This may take 1-2 minutes."):
-            try:
-                resp = requests.post(f"{API_URL}/documents/{doc_id}/structure", timeout=300)
-                if resp.status_code == 200:
-                    st.session_state.structure_data = resp.json()
-                    st.success("✅ Sections & diseases detected!")
-                elif resp.status_code == 503:
-                    st.warning(
-                        "⚠️ Gemini API is temporarily unavailable (high demand). "
-                        "All retry attempts were exhausted. Please wait a minute and try again."
-                    )
-                else:
-                    st.error(f"❌ Structuring failed: {resp.text}")
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
-
-# ── Structure Results ────────────────────────────────────────────────────
-if st.session_state.structure_data:
-    sd = st.session_state.structure_data
-
-    st.divider()
-    st.subheader("📊 Structure & Analysis Results")
-
-    # Summary metrics
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Sections Found", sd.get("sections_found", 0))
-    m2.metric("Total Diseases", sd.get("total_diseases", 0))
-    m3.metric("Total Sentences", sd.get("total_sentences", 0))
-
-    if sd.get("processing_stats"):
-        ps = sd["processing_stats"]
-        st.caption(
-            f"Processing: {ps.get('total_processing_time', 0):.2f}s | "
-            f"NER: {ps.get('ner_diseases', 0)} | "
-            f"LLM: {ps.get('llm_diseases', 0)}"
-        )
-
-    # ── Sections with Content ────────────────────────────────────────
-    sections = sd.get("sections", {})
-    if sections:
-        st.markdown("#### 📂 Detected Sections & Content")
-        for sec_name, sec_data in sections.items():
-            display_name = sec_name.replace("_", " ").title()
-            sec_text = sec_data.get("text", "") if isinstance(sec_data, dict) else str(sec_data)
-
-            with st.expander(f"📌 {display_name}", expanded=False):
-                st.text_area(
-                    f"Content — {display_name}",
-                    sec_text,
-                    height=150,
-                    disabled=True,
-                    key=f"sec_{sec_name}"
-                )
-
-    # Disease detection happens internally — results shown after MEAT validation in Step 3
-    diseases_count = len(sd.get("detected_diseases", []))
-    if diseases_count:
-        st.success(f"✅ {diseases_count} potential diseases identified. Proceed to Step 3 for MEAT validation & ICD mapping.")
-    else:
-        st.warning("No diseases detected in the document.")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 3: MEAT Validation + ICD-10 Codes
-# ═══════════════════════════════════════════════════════════════════════════
-if st.session_state.structure_data and st.session_state.document_id:
-    st.markdown("---")
-    st.header("🧬 Step 3: MEAT Validation + ICD-10 Codes")
-    st.info("Validate MEAT criteria (Monitoring, Evaluation, Assessment, Treatment) and map ICD-10 codes for all detected diseases.")
-
-    dietary_toggle = st.checkbox(
-        "🥗 Include Dietary Analysis (Phase 8)",
-        value=False,
-        help="When enabled, Phase 8 dietary/nutritional analysis annotations are included. Disabled by default to avoid filtering valid metabolic diseases."
-    )
-
-    if st.button("✅ Run MEAT + ICD Mapping", type="primary"):
-        st.session_state.unified_data = None
-
-        doc_id = st.session_state.document_id
-        with st.spinner("Running MEAT validation & ICD mapping… This may take 1-3 minutes."):
-            try:
-                resp = requests.post(
+                # Step 4: Process all (MEAT + ICD)
+                proc_resp = requests.post(
                     f"{API_URL}/documents/{doc_id}/process-all",
-                    params={"dietary_analysis": str(dietary_toggle).lower()},
-                    timeout=600
+                    params={"dietary_analysis": "false"},
+                    timeout=600,
                 )
-                if resp.status_code == 200:
-                    st.session_state.unified_data = resp.json()
-                    st.success("✅ MEAT validation & ICD mapping complete!")
-                elif resp.status_code == 503:
-                    st.warning(
-                        "⚠️ Gemini API is temporarily unavailable (high demand). "
-                        "All retry attempts were exhausted. Please wait a minute and try again."
-                    )
-                else:
-                    st.error(f"❌ Processing failed: {resp.text}")
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
+                if proc_resp.status_code == 503:
+                    st.warning("LLM API temporarily unavailable. Please retry in a moment.")
+                    error_occurred = True
+                elif proc_resp.status_code != 200:
+                    st.error(f"Processing failed: {proc_resp.text}")
+                    error_occurred = True
+
+            if not error_occurred:
+                st.session_state.unified_data = proc_resp.json()
+                progress.progress(100, text="Complete")
+
+        except requests.exceptions.ConnectionError:
+            st.error(f"Cannot connect to backend at {BACKEND_BASE_URL}")
+            error_occurred = True
+        except requests.exceptions.Timeout:
+            st.error("Request timed out. The document may be too large or the server is busy.")
+            error_occurred = True
+        except Exception as e:
+            st.error(f"Unexpected error: {e}")
+            error_occurred = True
+
+        if not error_occurred:
+            st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Show Active MEAT-Based Diseases
+# Results
 # ═══════════════════════════════════════════════════════════════════════════
 if st.session_state.unified_data:
     ud = st.session_state.unified_data
     unified_results = ud.get("unified_results", [])
     summary = ud.get("summary", {})
+    processing_time = ud.get("processing_time", 0)
+    total_detected = ud.get("total_detected", ud.get("total_diseases", 0))
+    total_excluded = ud.get("excluded_summary", {}).get("total_excluded", 0)
 
-    st.divider()
+    # ── Filename banner ──────────────────────────────────────────────
+    if st.session_state.filename:
+        st.markdown(f"**Results for** `{st.session_state.filename}`")
 
-    # ── Summary Metrics ──────────────────────────────────────────────
-    excluded = ud.get("excluded_summary", {})
-    total_detected = ud.get("total_detected", ud["total_diseases"])
-    total_excluded = excluded.get("total_excluded", 0)
+    # ── Key Metrics ──────────────────────────────────────────────────
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Active Diseases", ud.get("total_diseases", 0))
+    m2.metric("ICD-10 Mapped", summary.get("icd_mapped", 0))
+    m3.metric("Excluded", total_excluded)
+    m4.metric("Processing Time", f"{processing_time:.1f}s")
+    m5.metric("Source", ud.get("analysis_source", "dual_agent").replace("_", " ").title())
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Active MEAT Diseases", ud["total_diseases"])
-    m2.metric("🔢 ICD Mapped", summary.get("icd_mapped", 0))
-    m3.metric("🚫 Excluded", total_excluded)
+    # MEAT tier breakdown
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Strong Evidence", summary.get("strong_evidence", 0))
+    t2.metric("Moderate Evidence", summary.get("moderate_evidence", 0))
+    t3.metric("Weak Evidence", summary.get("weak_evidence", 0))
+    t4.metric("No MEAT", summary.get("no_meat", 0))
 
-    st.caption(f"Processing time: {ud.get('processing_time', 0):.2f}s | Detected: {total_detected} → Active (Full MEAT): {ud['total_diseases']}")
-
-    # ── Active MEAT-Based Diseases Table (Screenshot Format) ─────────
-    st.markdown("---")
-    st.subheader("Active MEAT-Based Diseases")
+    # ── Disease Table ────────────────────────────────────────────────
+    _TIER_BADGE = {
+        "strong_evidence":   "🟢 Strong",
+        "moderate_evidence": "🟡 Moderate",
+        "weak_evidence":     "🟠 Weak",
+        "no_meat":           "🔴 None",
+    }
 
     if unified_results:
+        st.markdown("---")
+        st.markdown("#### Disease Summary")
+
         table_data = []
         for r in unified_results:
             conf = r.get("confidence", 0)
+            tier = r.get("meat_tier", "")
             table_data.append({
-                "Disease": r["disease"],
-                "ICD-10 Code": r["icd_code"],
-                "Segment": r["segment"],
-                "Monitor": r.get("monitoring_evidence", "")[:80] or "—",
-                "Evaluate": r.get("evaluation_evidence", "")[:80] or "—",
-                "Assess": r.get("assessment_evidence", "")[:80] or "—",
-                "Treatment": r.get("treatment_evidence", "")[:80] or "—",
-                "MEAT Level": r.get("meat_level", ""),
-                "Confidence": f"{conf:.0%}" if isinstance(conf, (int, float)) else str(conf),
+                "#":          r.get("number", ""),
+                "Disease":    r.get("disease", ""),
+                "ICD-10":     r.get("icd_code", "—"),
+                "MEAT":       _TIER_BADGE.get(tier, tier),
+                "Score":      r.get("meat_score", 0),
+                "M": "✓" if r.get("monitoring")  else "",
+                "E": "✓" if r.get("evaluation")  else "",
+                "A": "✓" if r.get("assessment")  else "",
+                "T": "✓" if r.get("treatment")   else "",
+                "Confidence": f"{conf:.0%}" if isinstance(conf, (int, float)) else "—",
             })
 
         df = pd.DataFrame(table_data)
-
         st.dataframe(
             df,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Disease": st.column_config.TextColumn("Disease", width="medium"),
-                "ICD-10 Code": st.column_config.TextColumn("ICD-10 Code", width="small"),
-                "Segment": st.column_config.TextColumn("Segment", width="small"),
-                "Monitor": st.column_config.TextColumn("Monitor", width="medium"),
-                "Evaluate": st.column_config.TextColumn("Evaluate", width="medium"),
-                "Assess": st.column_config.TextColumn("Assess", width="medium"),
-                "Treatment": st.column_config.TextColumn("Treatment", width="medium"),
-                "MEAT Level": st.column_config.TextColumn("MEAT Level", width="small"),
-                "Confidence": st.column_config.TextColumn("Confidence", width="small"),
-            }
+                "#":          st.column_config.NumberColumn("#", width="small"),
+                "Disease":    st.column_config.TextColumn("Disease", width="large"),
+                "ICD-10":     st.column_config.TextColumn("ICD-10", width="small"),
+                "MEAT":       st.column_config.TextColumn("MEAT", width="medium"),
+                "Score":      st.column_config.NumberColumn("Score /4", width="small"),
+                "M":          st.column_config.TextColumn("M", width="small"),
+                "E":          st.column_config.TextColumn("E", width="small"),
+                "A":          st.column_config.TextColumn("A", width="small"),
+                "T":          st.column_config.TextColumn("T", width="small"),
+                "Confidence": st.column_config.TextColumn("Conf", width="small"),
+            },
         )
 
-        # ── Detailed Expandable Cards ────────────────────────────────
+        # ── Disease Detail Cards ─────────────────────────────────────
         st.markdown("---")
-        st.subheader("🔍 Detailed Disease Analysis")
+        st.markdown("#### Disease Details")
 
         for r in unified_results:
+            tier       = r.get("meat_tier", "")
+            tier_badge = _TIER_BADGE.get(tier, tier)
+            conf       = r.get("confidence", 0)
+            conf_str   = f"{conf:.0%}" if isinstance(conf, (int, float)) else "—"
+
             with st.expander(
-                f"#{r['number']} {r['disease']} → {r['icd_code']} | {r['disease_status']}",
-                expanded=False
+                f"#{r.get('number')} {r.get('disease', '')}  —  {r.get('icd_code', '—')}  |  {tier_badge}  |  {conf_str}",
+                expanded=False,
             ):
                 c1, c2, c3 = st.columns(3)
-                c1.markdown(f"**ICD-10:** {r['icd_code']}")
-                c2.markdown(f"**Status:** {r['disease_status']}")
-                c3.markdown(f"**Segment:** {r['segment']}")
-
-                st.markdown("**MEAT Evidence:**")
-                g1, g2, g3, g4 = st.columns(4)
-                with g1:
-                    st.markdown("✅ **Monitoring**")
-                    if r.get("monitoring_evidence"):
-                        st.caption(r["monitoring_evidence"][:200])
-                with g2:
-                    st.markdown("✅ **Evaluation**")
-                    if r.get("evaluation_evidence"):
-                        st.caption(r["evaluation_evidence"][:200])
-                with g3:
-                    st.markdown("✅ **Assessment**")
-                    if r.get("assessment_evidence"):
-                        st.caption(r["assessment_evidence"][:200])
-                with g4:
-                    st.markdown("✅ **Treatment**")
-                    if r.get("treatment_evidence"):
-                        st.caption(r["treatment_evidence"][:200])
-
-                if r.get("llm_reasoning"):
-                    st.caption(f"💡 Reasoning: {r['llm_reasoning']}")
+                c1.markdown(f"**ICD-10:** `{r.get('icd_code', '—')}`")
+                c2.markdown(f"**MEAT Tier:** {tier_badge}")
+                c3.markdown(f"**Score:** {r.get('meat_score', 0)} / 4")
 
                 if r.get("icd_description"):
-                    st.caption(f"📖 ICD Description: {r['icd_description']}")
+                    st.caption(r["icd_description"])
 
-        # ── Download Options ─────────────────────────────────────────
+                # MEAT evidence grid
+                cols = st.columns(4)
+                for i, (label, key) in enumerate([
+                    ("Monitoring", "monitoring_evidence"),
+                    ("Evaluation", "evaluation_evidence"),
+                    ("Assessment", "assessment_evidence"),
+                    ("Treatment", "treatment_evidence"),
+                ]):
+                    with cols[i]:
+                        ev = r.get(key, "")
+                        if ev:
+                            st.markdown(f"✅ **{label}**")
+                            st.caption(ev[:250])
+                        else:
+                            st.markdown(f"— **{label}**")
+
+                # Reasoning
+                reasoning_parts = []
+                if r.get("llm_reasoning"):
+                    reasoning_parts.append(r["llm_reasoning"])
+                if r.get("icd_selection_reasoning"):
+                    reasoning_parts.append(r["icd_selection_reasoning"])
+                if reasoning_parts:
+                    st.caption(" | ".join(reasoning_parts))
+
+        # ── Downloads ────────────────────────────────────────────────
         st.markdown("---")
-        st.subheader("⬇️ Download Results")
-
-        # 8-column billing-ready format
-        export_rows = []
-        for r in unified_results:
-            conf = r.get("confidence", 0)
-            export_rows.append({
-                "Disease": r["disease"],
-                "ICD-10 Code": r["icd_code"],
-                "Segment": r["segment"],
-                "Monitor": r.get("monitoring_evidence", ""),
-                "Evaluate": r.get("evaluation_evidence", ""),
-                "Assess": r.get("assessment_evidence", ""),
-                "Treatment": r.get("treatment_evidence", ""),
-                "MEAT Level": r.get("meat_level", ""),
-                "Confidence": f"{conf:.0%}" if isinstance(conf, (int, float)) else str(conf),
-            })
-
-        export_df = pd.DataFrame(export_rows)
         filename_stem = Path(st.session_state.filename or "document").stem
 
-        dcol1, dcol2, dcol3 = st.columns(3)
+        billing_rows = []
+        for r in unified_results:
+            conf = r.get("confidence", 0)
+            billing_rows.append({
+                "Disease":       r.get("disease", ""),
+                "ICD-10 Code":   r.get("icd_code", ""),
+                "ICD Description": r.get("icd_description", ""),
+                "MEAT Tier":     r.get("meat_tier", ""),
+                "MEAT Score":    r.get("meat_score", 0),
+                "M": "✓" if r.get("monitoring") else "",
+                "E": "✓" if r.get("evaluation") else "",
+                "A": "✓" if r.get("assessment") else "",
+                "T": "✓" if r.get("treatment") else "",
+                "Confidence":    f"{conf:.0%}" if isinstance(conf, (int, float)) else "—",
+            })
+        billing_df = pd.DataFrame(billing_rows)
 
+        full_rows = []
+        for r in unified_results:
+            conf = r.get("confidence", 0)
+            full_rows.append({
+                "Disease":                r.get("disease", ""),
+                "ICD-10 Code":            r.get("icd_code", ""),
+                "ICD Description":        r.get("icd_description", ""),
+                "Section":                r.get("segment", ""),
+                "MEAT Tier":              r.get("meat_tier", ""),
+                "MEAT Score":             r.get("meat_score", 0),
+                "MEAT Status":            r.get("meat_status", ""),
+                "M":                      "✓" if r.get("monitoring") else "",
+                "E":                      "✓" if r.get("evaluation") else "",
+                "A":                      "✓" if r.get("assessment") else "",
+                "T":                      "✓" if r.get("treatment") else "",
+                "Monitoring Evidence":    r.get("monitoring_evidence", ""),
+                "Evaluation Evidence":    r.get("evaluation_evidence", ""),
+                "Assessment Evidence":    r.get("assessment_evidence", ""),
+                "Treatment Evidence":     r.get("treatment_evidence", ""),
+                "Confidence":             f"{conf:.0%}" if isinstance(conf, (int, float)) else "—",
+                "LLM Reasoning":          r.get("llm_reasoning", ""),
+                "ICD Selection Reasoning": r.get("icd_selection_reasoning", ""),
+            })
+        full_df = pd.DataFrame(full_rows)
+
+        dcol1, dcol2 = st.columns(2)
         with dcol1:
             st.download_button(
-                "⬇️ Billing Ready (CSV)",
-                export_df.to_csv(index=False),
-                file_name=f"{filename_stem}_billing_ready.csv",
+                "📋 Billing CSV",
+                billing_df.to_csv(index=False),
+                file_name=f"{filename_stem}_billing.csv",
                 mime="text/csv",
-                help="8-column CSV: Disease, ICD-10 Code, Segment, Monitor, Evaluate, Assess, Treatment, MEAT Level"
+                use_container_width=True,
             )
-
         with dcol2:
-            # Full report includes ICD description
-            full_rows = []
-            for r in unified_results:
-                conf = r.get("confidence", 0)
-                full_rows.append({
-                    "Disease": r["disease"],
-                    "ICD-10 Code": r["icd_code"],
-                    "ICD Description": r.get("icd_description", ""),
-                    "Segment": r["segment"],
-                    "Monitor": r.get("monitoring_evidence", ""),
-                    "Evaluate": r.get("evaluation_evidence", ""),
-                    "Assess": r.get("assessment_evidence", ""),
-                    "Treatment": r.get("treatment_evidence", ""),
-                    "MEAT Level": r.get("meat_level", ""),
-                    "Confidence": f"{conf:.0%}" if isinstance(conf, (int, float)) else str(conf),
-                    "LLM Reasoning": r.get("llm_reasoning", ""),
-                })
-            full_df = pd.DataFrame(full_rows)
             st.download_button(
-                "⬇️ Full Report (CSV)",
+                "📄 Full Report CSV",
                 full_df.to_csv(index=False),
                 file_name=f"{filename_stem}_full_report.csv",
                 mime="text/csv",
-                help="Full report including ICD descriptions and LLM reasoning"
+                use_container_width=True,
             )
 
-        with dcol3:
-            # Server-side CSV export via backend endpoint
-            doc_id = st.session_state.document_id
-            try:
-                api_csv = requests.get(
-                    f"{API_URL}/documents/{doc_id}/export-csv",
-                    timeout=30
-                )
-                if api_csv.status_code == 200:
-                    st.download_button(
-                        "⬇️ Server Export (CSV)",
-                        api_csv.content,
-                        file_name=f"{filename_stem}_server_export.csv",
-                        mime="text/csv",
-                        help="CSV generated directly from the server database"
-                    )
-                else:
-                    st.caption("Server export unavailable")
-            except Exception:
-                st.caption("Server export unavailable")
-
     else:
-        st.warning("No active MEAT-based diseases found.")
-
-# ── Footer ───────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.caption("Autonomous ICD-10 Coding Tool | Developed for clinical document intelligence")
+        st.info("No active diseases found after MEAT validation.")

@@ -139,25 +139,24 @@ class MEATProcessor:
             sections_lower = {s.lower() for s in segment_sources}
             is_pmh_only = bool(sections_lower & self._PMH_SECTION_NAMES) and not bool(sections_lower & self._ACTIVE_SECTION_NAMES)
 
-            # Tier Rules:
-            #   Full MEAT   → All 4 criteria satisfied
-            #   Medium MEAT → 3 of 4 criteria satisfied
-            #   Half MEAT   → A + at least 1 other (2 total, valid)
-            #   History Only → PMH-only disease with no/insufficient MEAT evidence
-            #   Invalid     → Failed gate (no Assessment, or Assessment but no management)
-            if validation["meat_valid"] and meat_count == 4:
-                meat_tier = "full_meat"
-            elif validation["meat_valid"] and meat_count == 3:
-                meat_tier = "medium_meat"
+            # Tier Rules (evidence-based):
+            #   Strong Evidence → 3+ criteria with documented evidence
+            #   Moderate Evidence → 2 criteria with documented evidence
+            #   Weak Evidence → 1 criterion with documented evidence
+            #   No MEAT → No documented evidence found
+            if validation["meat_valid"] and meat_count >= 3:
+                meat_tier = "strong_evidence"
             elif validation["meat_valid"] and meat_count >= 2:
-                meat_tier = "half_meat"
+                meat_tier = "moderate_evidence"
+            elif meat_count >= 1:
+                meat_tier = "weak_evidence"
             elif is_pmh_only:
-                meat_tier = "history_only"
+                meat_tier = "no_meat"
             else:
-                meat_tier = "invalid"
+                meat_tier = "no_meat"
 
             # Determine final status for the caller
-            if meat_tier == "history_only":
+            if meat_tier == "no_meat" and is_pmh_only:
                 final_status = "history_only"
                 history_only_count += 1
             elif validation["meat_valid"]:

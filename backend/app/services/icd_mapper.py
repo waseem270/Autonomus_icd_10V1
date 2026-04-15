@@ -3,6 +3,7 @@ import logging
 
 from .icd_lookup import icd_lookup
 from .icd_ranker import icd_ranker
+from .deterministic_validator import deterministic_validator
 from ..core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,34 @@ class ICDMapper:
             "llm_reasoning": best_candidate.get("llm_reasoning", "")
         })
         
-        # Step 5: Confidence-Based Control (Gating)
+        # Step 5: Deterministic Validation — reject hallucinated codes
+        if result["icd_code"]:
+            validation = deterministic_validator.validate_icd_code(result["icd_code"])
+            if not validation["valid"]:
+                self.logger.warning(
+                    f"❌ ICD code '{result['icd_code']}' failed validation: {validation['reason']}"
+                )
+                result.update({
+                    "icd_code": None, "icd_description": None,
+                    "confidence": 0.0, "status": "not_found",
+                    "mapping_method": "rejected_invalid",
+                    "llm_reasoning": f"Code rejected: {validation['reason']}"
+                })
+                return result
+
+            # Cross-validate disease name against ICD description
+            xval = deterministic_validator.cross_validate_disease_icd(
+                disease_name, result["icd_code"]
+            )
+            if not xval["match"]:
+                self.logger.warning(
+                    f"❌ Cross-validation failed for '{disease_name}' → {result['icd_code']}: {xval['reason']}"
+                )
+                result["status"] = "manual_review"
+                result["confidence"] = min(result["confidence"], 0.5)
+                result["llm_reasoning"] += f" | Cross-validation warning: {xval['reason']}"
+
+        # Step 6: Confidence-Based Control (Gating)
         # Auto-assign high-confidence matches; lower confidence → manual review
         auto_threshold = getattr(settings, "ICD_AUTO_ASSIGN_THRESHOLD", 0.90)
         review_threshold = getattr(settings, "ICD_MANUAL_REVIEW_THRESHOLD", 0.70)

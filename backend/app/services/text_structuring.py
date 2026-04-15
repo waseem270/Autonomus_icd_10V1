@@ -162,7 +162,10 @@ class TextStructuringService:
 
             # 3a. PMH structured-entry parsing (deterministic)
             for section_name, section_data in sections.items():
-                section_content = section_data.get("text", "")
+                section_content = (
+                    section_data.get("text", "") if isinstance(section_data, dict)
+                    else str(section_data)
+                )
                 if not section_content:
                     continue
                 if section_name.lower() == "past_medical_history":
@@ -171,7 +174,10 @@ class TextStructuringService:
 
             # 3b. Regex-based candidate extraction per section (backup / seed)
             for section_name, section_data in sections.items():
-                section_content = section_data.get("text", "")
+                section_content = (
+                    section_data.get("text", "") if isinstance(section_data, dict)
+                    else str(section_data)
+                )
                 if not section_content:
                     continue
                 regex_candidates = extract_disease_candidates(
@@ -196,8 +202,10 @@ class TextStructuringService:
         if sections:
             med_section = None
             for key in ("medications", "current_medications"):
-                if key in sections and sections[key].get("text", "").strip():
-                    med_section = sections[key]["text"]
+                _sv = sections.get(key)
+                _sv_text = (_sv.get("text", "") if isinstance(_sv, dict) else str(_sv or ""))
+                if _sv and _sv_text.strip():
+                    med_section = _sv_text
                     break
             if med_section:
                 med_diseases = self._infer_diseases_from_medications(
@@ -539,19 +547,49 @@ class TextStructuringService:
         Handles:
         - List artifacts: "1. Diabetes" vs "Diabetes"
         - Bullet points: "• Hypertension" vs "Hypertension"
-        - Whitespace variations
-        - Case differences
-        
+        - Whitespace variations, case differences
+        - Abbreviation expansion: "HTN" matches "Hypertension"
+        - Substring containment: "Hypertension" subsumes "Essential hypertension"
+        - Negated diseases: filter out negated duplicates
+
         When duplicates found, keeps first occurrence and merges section_sources.
         """
-        seen = {}
+        from ..utils.abbreviation_expander import MEDICAL_ABBREVIATIONS
+        _abbr_map = {k.lower(): v.lower() for k, v in MEDICAL_ABBREVIATIONS.items()}
+
+        seen = {}         # norm_key → disease dict
         deduplicated = []
         
         for disease in diseases:
+            # Skip negated diseases early — they should not appear in final output
+            if disease.get("negated", False):
+                continue
+
             # Normalize for comparison
             norm_key = self._normalize_for_dedup(disease["disease_name"])
             
-            if norm_key not in seen:
+            # Also check abbreviation expansion
+            expanded_key = _abbr_map.get(norm_key, norm_key)
+
+            matched_key = None
+            for key in (norm_key, expanded_key):
+                if key in seen:
+                    matched_key = key
+                    break
+            
+            # Substring check: if norm_key is a substring of an existing key (or vice versa)
+            if matched_key is None:
+                for existing_key in list(seen.keys()):
+                    if norm_key in existing_key or existing_key in norm_key:
+                        matched_key = existing_key
+                        # If new name is longer (more specific), promote it
+                        if len(norm_key) > len(existing_key):
+                            # Re-key under the more specific name
+                            seen[norm_key] = seen.pop(existing_key)
+                            matched_key = norm_key
+                        break
+
+            if matched_key is None:
                 # First occurrence - clean the name and store
                 disease["disease_name"] = self._clean_disease_name(disease["disease_name"])
                 disease["normalized_name"] = norm_key
@@ -561,7 +599,7 @@ class TextStructuringService:
                 
             else:
                 # Duplicate found - merge section sources into existing entry
-                existing = seen[norm_key]
+                existing = seen[matched_key]
                 
                 # Get section sources from both
                 existing_sources = existing.get("section_sources", [existing.get("section", "unknown")])
@@ -574,6 +612,11 @@ class TextStructuringService:
                 # Use higher confidence score if available
                 if disease.get("confidence_score", 0) > existing.get("confidence_score", 0):
                     existing["confidence_score"] = disease["confidence_score"]
+                
+                # If new disease name is longer (more specific), use it
+                if len(disease["disease_name"]) > len(existing["disease_name"]):
+                    existing["disease_name"] = self._clean_disease_name(disease["disease_name"])
+                    existing["normalized_name"] = norm_key
                 
                 self.logger.debug(
                     f"Merged duplicate: '{disease['disease_name']}' "
