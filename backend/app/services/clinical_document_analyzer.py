@@ -262,7 +262,7 @@ class ClinicalDocumentAnalyzer:
         # All strategies failed — raise so outer handler catches it
         raise json.JSONDecodeError("All JSON repair strategies failed", text, 0)
 
-    def _build_config(self) -> types.GenerateContentConfig:
+    def _build_config(self) -> SimpleNamespace:
         """Build a fresh GenerateContentConfig, loading system_prompt from prompt.json each time."""
         system_instr = (
             "You are a senior clinical coding specialist with 20+ years of "
