@@ -37,8 +37,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional, Set
 
-import google.genai as genai
-from google.genai import types
+from types import SimpleNamespace
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..core.config import settings
@@ -81,14 +80,8 @@ CANONICAL_SECTIONS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Safety settings — disable content filtering for medical documents
-# ---------------------------------------------------------------------------
-SAFETY_SETTINGS = [
-    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-]
+# Safety settings
+SAFETY_SETTINGS = []
 
 
 # ===========================================================================
@@ -794,11 +787,12 @@ class SmartSectionDetector:
         self._content_inferrer = _content_inferrer
 
         # Config for section detection (needs structured JSON output)
-        self.detect_config = types.GenerateContentConfig(
+        self.detect_config = SimpleNamespace(
             temperature=0.0,
             max_output_tokens=16384,
             response_mime_type="application/json",
-            safety_settings=SAFETY_SETTINGS,
+            response_schema=None,
+            safety_settings=[],
             system_instruction=(
                 "You are a medical documentation expert specializing in EHR structure and clinical NLP. "
                 "Your mission is to parse clinical notes into canonical sections while identifying specific, "
@@ -807,24 +801,21 @@ class SmartSectionDetector:
         )
 
         # Config for shorter tasks (validation, name mapping)
-        self.quick_config = types.GenerateContentConfig(
+        self.quick_config = SimpleNamespace(
             temperature=0.0,
             max_output_tokens=8192,
             response_mime_type="application/json",
-            safety_settings=SAFETY_SETTINGS,
+            response_schema=None,
+            safety_settings=[],
             system_instruction="You are a medical terminology expert. Map clinical terms to canonical section names."
         )
 
     @property
     def client(self):
         if self._client is None:
-            from ..core.config import get_llm_provider, create_genai_client, create_openai_client
-            provider = get_llm_provider()
-            if provider == "openai":
-                oai = create_openai_client()
-                self._client = oai if oai else "__openai_sentinel__"
-            else:
-                self._client = create_genai_client()
+            from ..core.config import create_openai_client
+            oai = create_openai_client()
+            self._client = oai if oai else "__openai_sentinel__"
         return self._client
 
     # ==================================================================

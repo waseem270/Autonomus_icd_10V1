@@ -1,0 +1,169 @@
+{
+  "total_pdfs": 10,
+  "total_expected": 53,
+  "total_predicted": 55,
+  "total_matched": 40,
+  "total_extra": 15,
+  "total_missing": 13,
+  "overall_precision": 0.7273,
+  "overall_recall": 0.7547,
+  "overall_f1": 0.7407,
+  "error_breakdown": {
+    "overcoding_unknown": 13,
+    "overcoding_inactive_chronic": 1,
+    "overcoding_incidental": 1
+  },
+  "per_pdf": [
+    {
+      "mrn": "1477127",
+      "expected": 6,
+      "predicted": 5,
+      "matched": 5,
+      "extra": [],
+      "missing": [
+        "J02.9"
+      ],
+      "precision": 1.0,
+      "recall": 0.8333,
+      "f1": 0.9091
+    },
+    {
+      "mrn": "2137395",
+      "expected": 3,
+      "predicted": 4,
+      "matched": 3,
+      "extra": [
+        "I10"
+      ],
+      "missing": [],
+      "precision": 0.75,
+      "recall": 1.0,
+      "f1": 0.8571
+    },
+    {
+      "mrn": "4195560",
+      "expected": 4,
+      "predicted": 3,
+      "matched": 3,
+      "extra": [],
+      "missing": [
+        "K21.9"
+      ],
+      "precision": 1.0,
+      "recall": 0.75,
+      "f1": 0.8571
+    },
+    {
+      "mrn": "5509215",
+      "expected": 6,
+      "predicted": 11,
+      "matched": 6,
+      "extra": [
+        "D69.6",
+        "F10.10",
+        "I50.32",
+        "N18.32",
+        "Z79.899"
+      ],
+      "missing": [],
+      "precision": 0.5455,
+      "recall": 1.0,
+      "f1": 0.7059
+    },
+    {
+      "mrn": "5590960",
+      "expected": 3,
+      "predicted": 2,
+      "matched": 2,
+      "extra": [],
+      "missing": [
+        "H92.03"
+      ],
+      "precision": 1.0,
+      "recall": 0.6667,
+      "f1": 0.8
+    },
+    {
+      "mrn": "5841830",
+      "expected": 12,
+      "predicted": 10,
+      "matched": 10,
+      "extra": [],
+      "missing": [
+        "I48.92",
+        "J96.11"
+      ],
+      "precision": 1.0,
+      "recall": 0.8333,
+      "f1": 0.9091
+    },
+    {
+      "mrn": "7750233",
+      "expected": 6,
+      "predicted": 3,
+      "matched": 2,
+      "extra": [
+        "K64.0"
+      ],
+      "missing": [
+        "E66.3",
+        "R03.0",
+        "Z68.27",
+        "Z80.0"
+      ],
+      "precision": 0.6667,
+      "recall": 0.3333,
+      "f1": 0.4444
+    },
+    {
+      "mrn": "8331786",
+      "expected": 4,
+      "predicted": 5,
+      "matched": 3,
+      "extra": [
+        "H01.114",
+        "T78.40XA"
+      ],
+      "missing": [
+        "H01.121"
+      ],
+      "precision": 0.6,
+      "recall": 0.75,
+      "f1": 0.6667
+    },
+    {
+      "mrn": "8884485",
+      "expected": 3,
+      "predicted": 3,
+      "matched": 3,
+      "extra": [],
+      "missing": [],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    {
+      "mrn": "945509",
+      "expected": 6,
+      "predicted": 9,
+      "matched": 3,
+      "extra": [
+        "B02.9",
+        "D50.9",
+        "G96.11",
+        "J30.2",
+        "M81.0",
+        "R73.03"
+      ],
+      "missing": [
+        "E87.6",
+        "I70.90",
+        "R11.0"
+      ],
+      "precision": 0.3333,
+      "recall": 0.5,
+      "f1": 0.4
+    }
+  ],
+  "total_time": 289.8
+}

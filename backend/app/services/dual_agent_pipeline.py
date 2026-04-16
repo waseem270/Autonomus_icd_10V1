@@ -245,19 +245,16 @@ class DualAgentPipeline:
         )
 
         # Build config
-        from google.genai import types
-        from ..core.config import settings as _cfg, get_llm_provider
-        _model_name = (getattr(self.analyzer, "model_name", None) or _cfg.GEMINI_MODEL or "").lower()
-        _is_gemini_pro = "gemini-3" in _model_name and "pro" in _model_name
-        _thinking_budget = 1024 if _is_gemini_pro else 0
+        from types import SimpleNamespace
         _max_tokens = 4096  # Sufficient for verification JSON
-        config = types.GenerateContentConfig(
+        config = SimpleNamespace(
             temperature=0.2,
             max_output_tokens=_max_tokens,
             top_p=0.95,
             system_instruction=_AGENT2_SYSTEM,
             response_mime_type="application/json",
-            thinking_config=types.ThinkingConfig(thinking_budget=_thinking_budget),
+            response_schema=None,
+            safety_settings=[],
         )
 
         try:

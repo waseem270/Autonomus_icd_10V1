@@ -35,24 +35,12 @@ class Settings(BaseSettings):
     UPLOAD_FOLDER: str = str(UPLOADS_DIR)
     ALLOWED_EXTENSIONS: str = ".pdf"
     
-    # Gemini / Vertex AI
-    GEMINI_API_KEY: Optional[str] = None
-    GCP_PROJECT: str = "gen-lang-client-0574304931"
-    GCP_LOCATION: str = "us-central1"
-    GEMINI_MODEL: str = "gemini-3-flash-preview"
-    GEMINI_MAX_TOKENS: int = 16384
-    GEMINI_TEMPERATURE: float = 0.5
-    GEMINI_TOP_P: float = 0.95
-    GEMINI_TIMEOUT: int = 60
-    GEMINI_MAX_RETRIES: int = 3
-    GEMINI_RETRY_DELAY: int = 2
-    
     # OpenAI
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-5.4"
-    
-    # LLM Provider: "openai", "gemini", or empty (auto-detect)
-    LLM_PROVIDER: str = ""
+    OPENAI_TEMPERATURE: float = 0.1
+    OPENAI_TOP_P: float = 0.95
+    OPENAI_MAX_TOKENS: int = 16384
     
     # Cost & Token Control limits
     # Halts pipeline extraction if the cumulative session exceeds these
@@ -111,28 +99,14 @@ settings = Settings()
 
 
 def get_llm_provider() -> str:
-    """Determine which LLM provider to use: 'openai' or 'gemini'."""
-    if settings.LLM_PROVIDER:
-        return settings.LLM_PROVIDER.lower()
-    # Auto-detect: prefer OpenAI if key is set, else fall back to Gemini
-    if settings.OPENAI_API_KEY:
-        return "openai"
-    if settings.GEMINI_API_KEY:
-        return "gemini"
-    return "gemini"
+    """Always returns 'openai'."""
+    return "openai"
 
 
 def get_active_model() -> str:
-    """Return the model name for the active LLM provider."""
-    provider = get_llm_provider()
-    if provider == "openai":
-        return settings.OPENAI_MODEL
-    return settings.GEMINI_MODEL
+    """Return the active OpenAI model name."""
+    return settings.OPENAI_MODEL
 
-
-# Cached Gemini client — created lazily on first use
-_genai_client = None
-_genai_client_initialized = False
 
 # Cached OpenAI client
 _openai_client = None
@@ -164,33 +138,3 @@ def create_openai_client():
     _openai_client_initialized = True
     return None
 
-
-def create_genai_client():
-    """Create or return the cached google.genai Client using API key."""
-    global _genai_client, _genai_client_initialized
-    
-    if _genai_client_initialized:
-        return _genai_client
-    
-    from google import genai
-    from dotenv import load_dotenv
-    import logging
-
-    # Ensure .env vars are in os.environ (pydantic doesn't always export them)
-    load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
-
-    _logger = logging.getLogger(__name__)
-
-    if settings.GEMINI_API_KEY:
-        try:
-            client = genai.Client(api_key=settings.GEMINI_API_KEY)
-            _logger.info("Gemini client initialised via API key.")
-            _genai_client = client
-            _genai_client_initialized = True
-            return client
-        except Exception as e:
-            _logger.error(f"API key init failed: {e}")
-
-    _logger.error("No GEMINI_API_KEY configured.")
-    _genai_client_initialized = True
-    return None

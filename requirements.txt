@@ -26,8 +26,7 @@ spacy==3.6.1
 scispacy==0.5.3
 negspacy==1.0.4
 
-# --- Backend: LLM (Gemini) ---
-google-genai>=1.68.0
+# --- Backend: LLM ---
 openai>=1.30.0
 
 # --- Backend: Utilities ---

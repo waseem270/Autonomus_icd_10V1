@@ -21,8 +21,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, Tuple
 
-import google.genai as genai
-from google.genai import types
+from types import SimpleNamespace
 
 from ..core.config import settings
 from .icd_lookup import ICDLookupService
@@ -125,107 +124,10 @@ def _abbreviation_aware_match(candidate: str, existing_names: set) -> bool:
 # ---------------------------------------------------------------------------
 # Safety settings — disable content filtering for medical documents
 # ---------------------------------------------------------------------------
-SAFETY_SETTINGS = [
-    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-]
+SAFETY_SETTINGS = []
 
-# ---------------------------------------------------------------------------
-# Guaranteed response schema — Gemini will always return this exact structure.
-# This eliminates the most common single-pass failure mode: hallucinated field
-# names or missing keys that silently drop all results.
-# ---------------------------------------------------------------------------
-_MEAT_VALIDATION_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "M_monitor": types.Schema(type=types.Type.STRING),
-        "E_evaluate": types.Schema(type=types.Type.STRING),
-        "A_assess": types.Schema(type=types.Type.STRING),
-        "T_treat": types.Schema(type=types.Type.STRING),
-        "meat_score": types.Schema(type=types.Type.NUMBER),
-        "meat_grade": types.Schema(type=types.Type.STRING),
-        "meat_grade_reasoning": types.Schema(type=types.Type.STRING),
-        "primary_activation_basis": types.Schema(type=types.Type.STRING),
-    },
-)
-
-_DISEASE_ITEM_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "index": types.Schema(type=types.Type.INTEGER),
-        "disease_name": types.Schema(type=types.Type.STRING),
-        "active_status": types.Schema(type=types.Type.STRING),
-        "meat_grade": types.Schema(type=types.Type.STRING),
-        "meat_score": types.Schema(type=types.Type.NUMBER),
-        "priority_level": types.Schema(type=types.Type.STRING),
-        "source_section": types.Schema(type=types.Type.STRING),
-        "all_sections_mentioned": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(type=types.Type.STRING),
-        ),
-        "context_snippets": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(type=types.Type.STRING),
-        ),
-        "meat_validation": _MEAT_VALIDATION_SCHEMA,
-        "icd10_code": types.Schema(type=types.Type.STRING),
-        "icd10_description": types.Schema(type=types.Type.STRING),
-        "icd10_selection_reasoning": types.Schema(type=types.Type.STRING),
-        "hcc_status": types.Schema(type=types.Type.STRING),
-    },
-)
-
-_EXCLUDED_ITEM_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "term": types.Schema(type=types.Type.STRING),
-        "reason_excluded": types.Schema(type=types.Type.STRING),
-        "source_section": types.Schema(type=types.Type.STRING),
-        "exclusion_reasoning": types.Schema(type=types.Type.STRING),
-    },
-)
-
-_SUMMARY_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "total_diseases_considered": types.Schema(type=types.Type.INTEGER),
-        "total_raw_detected": types.Schema(type=types.Type.INTEGER),
-        "total_active_diseases": types.Schema(type=types.Type.INTEGER),
-        "total_historical": types.Schema(type=types.Type.INTEGER),
-        "total_icd10_assigned": types.Schema(type=types.Type.INTEGER),
-        "full_meat_count": types.Schema(type=types.Type.INTEGER),
-        "high_meat_count": types.Schema(type=types.Type.INTEGER),
-        "partial_meat_count": types.Schema(type=types.Type.INTEGER),
-        "low_meat_count": types.Schema(type=types.Type.INTEGER),
-        "assessment_sourced": types.Schema(type=types.Type.INTEGER),
-        "pmh_sourced": types.Schema(type=types.Type.INTEGER),
-        "medication_inferred": types.Schema(type=types.Type.INTEGER),
-        "lab_implied": types.Schema(type=types.Type.INTEGER),
-        "total_excluded": types.Schema(type=types.Type.INTEGER),
-    },
-)
-
-_ANALYSIS_RESPONSE_SCHEMA = types.Schema(
-    type=types.Type.OBJECT,
-    required=["sections_found", "summary", "diseases", "excluded_conditions"],
-    properties={
-        "sections_found": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(type=types.Type.STRING),
-        ),
-        "summary": _SUMMARY_SCHEMA,
-        "diseases": types.Schema(
-            type=types.Type.ARRAY,
-            items=_DISEASE_ITEM_SCHEMA,
-        ),
-        "excluded_conditions": types.Schema(
-            type=types.Type.ARRAY,
-            items=_EXCLUDED_ITEM_SCHEMA,
-        ),
-    },
-)
+# Response schema not used with OpenAI (uses json_object mode instead)
+_ANALYSIS_RESPONSE_SCHEMA = None
 
 
 class ClinicalDocumentAnalyzer:
@@ -259,15 +161,9 @@ class ClinicalDocumentAnalyzer:
     def client(self):
         """Lazy-init LLM client on first use. Returns a sentinel for OpenAI."""
         if self._client is None:
-            from ..core.config import get_llm_provider, create_genai_client, create_openai_client
-            provider = get_llm_provider()
-            if provider == "openai":
-                # OpenAI calls go through llm_provider, not the client directly.
-                # Return a sentinel so `if not self.client` checks pass.
-                oai = create_openai_client()
-                self._client = oai if oai else "__openai_sentinel__"
-            else:
-                self._client = create_genai_client()
+            from ..core.config import create_openai_client
+            oai = create_openai_client()
+            self._client = oai if oai else "__openai_sentinel__"
         return self._client
 
     def _parse_json_robust(self, text: str) -> dict:
@@ -379,17 +275,14 @@ class ClinicalDocumentAnalyzer:
         except Exception:
             pass
 
-        model_name = (settings.GEMINI_MODEL or "").lower()
-        # Gemini 3 Pro requires thinking mode; budget 0 is invalid for those models.
-        thinking_budget = 1024 if ("gemini-3" in model_name and "pro" in model_name) else 0
+        model_name = (settings.OPENAI_MODEL or "").lower()
 
-        return types.GenerateContentConfig(
-            temperature=settings.GEMINI_TEMPERATURE,
-            top_p=settings.GEMINI_TOP_P,
-            max_output_tokens=max(settings.GEMINI_MAX_TOKENS, 16384),
+        return SimpleNamespace(
+            temperature=0.1,
+            top_p=0.95,
+            max_output_tokens=16384,
             response_mime_type="application/json",
             response_schema=_ANALYSIS_RESPONSE_SCHEMA,
-            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
             safety_settings=SAFETY_SETTINGS,
             system_instruction=system_instr,
         )

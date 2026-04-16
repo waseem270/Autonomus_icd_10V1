@@ -102,11 +102,11 @@ circuit_breaker = GeminiCircuitBreaker(cooldown=30.0)
 
 gemini_retry = retry(
     retry=retry_if_exception(_is_retryable_error),
-    stop=stop_after_attempt(settings.GEMINI_MAX_RETRIES),      # default 3
+    stop=stop_after_attempt(3),
     wait=wait_exponential(
-        multiplier=settings.GEMINI_RETRY_DELAY,                # default 2
-        min=settings.GEMINI_RETRY_DELAY,
-        max=10,                                                # cap at 10s
+        multiplier=2,
+        min=2,
+        max=10,
     ),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,

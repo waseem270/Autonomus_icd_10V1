@@ -1,25 +1,15 @@
 import json
 import logging
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
-
-from google import genai
-from google.genai import types
 
 from ..core.config import settings
 from ..utils.gemini_retry import call_gemini_safe as call_gemini
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Safety settings — disable content filtering for medical documents
-# ---------------------------------------------------------------------------
-SAFETY_SETTINGS = [
-    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-]
+SAFETY_SETTINGS = []
 
 
 class MEATValidator:
@@ -41,10 +31,11 @@ class MEATValidator:
             
             # Config for MEAT validation — needs structured JSON output
             # with extended thinking for better clinical reasoning
-            self.config = types.GenerateContentConfig(
-                temperature=0.1,   # Slight temperature for varied evidence extraction
+            self.config = SimpleNamespace(
+                temperature=0.1,
                 max_output_tokens=4096,
                 response_mime_type="application/json",
+                response_schema=None,
                 safety_settings=SAFETY_SETTINGS,
                 system_instruction=(
                     "You are a specialized Medical Risk Adjustment Auditor. "
@@ -61,13 +52,9 @@ class MEATValidator:
     @property
     def client(self):
         if self._client is None:
-            from ..core.config import get_llm_provider, create_genai_client, create_openai_client
-            provider = get_llm_provider()
-            if provider == "openai":
-                oai = create_openai_client()
-                self._client = oai if oai else "__openai_sentinel__"
-            else:
-                self._client = create_genai_client()
+            from ..core.config import create_openai_client
+            oai = create_openai_client()
+            self._client = oai if oai else "__openai_sentinel__"
         return self._client
 
     async def validate_meat(

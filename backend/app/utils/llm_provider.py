@@ -139,10 +139,10 @@ async def call_openai(
     if client is None:
         raise RuntimeError("OpenAI client not initialized")
 
-    # Extract parameters from Gemini config object
-    temperature = getattr(config, "temperature", settings.GEMINI_TEMPERATURE)
-    max_tokens = getattr(config, "max_output_tokens", settings.GEMINI_MAX_TOKENS)
-    top_p = getattr(config, "top_p", settings.GEMINI_TOP_P)
+    # Extract parameters from config object
+    temperature = getattr(config, "temperature", 0.1)
+    max_tokens = getattr(config, "max_output_tokens", 16384)
+    top_p = getattr(config, "top_p", 0.95)
     system_instruction = getattr(config, "system_instruction", None) or ""
 
     # Build response_format — use json_object if response_mime_type is JSON
